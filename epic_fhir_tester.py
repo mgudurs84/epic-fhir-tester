@@ -112,13 +112,14 @@ DEFAULTS = {
     "patient_id": "",
     "private_key_pem": "",
     "key_algorithm": "RS256",
-    "kid": "",
+    "kid": "6bd2d4b1-c99b-4eb2-99bc-5395e31dd6ad",
     "authorize_endpoint": "",
     "token_endpoint": "",
     "jwt_generated": "",
     "token_response_raw": "",
     "fhir_results": {},
     "smart_config_raw": "",
+    "tefca_id_token": "",
 }
 for k, v in DEFAULTS.items():
     if k not in st.session_state:
@@ -287,6 +288,44 @@ elif step == 2:
     st.session_state.redirect_uri = redirect_uri
     st.session_state.scopes = scopes
 
+    # TEFCA IAS extension parameters
+    st.markdown("---")
+    st.markdown("#### 🔐 TEFCA IAS Extension (CLEAR id_token)")
+    st.markdown("""
+    <div class='info-box'>
+    For TEFCA IAS, the authorize URL needs the CLEAR identity proofing token.
+    In <strong>Epic Sandbox</strong>, fake CSP tokens are accepted.
+    In <strong>SIT / Production</strong>, this must be a real CLEAR OIDC id_token.<br><br>
+    The Accounts Team provides this token — it proves the patient (Camila Lopez) was identity-proofed to IAL2.
+    </div>
+    """, unsafe_allow_html=True)
+
+    include_tefca = st.checkbox("Include TEFCA IAS parameters in authorize URL", value=True)
+    tefca_purpose = ""
+    tefca_id_token = ""
+
+    if include_tefca:
+        col_t1, col_t2 = st.columns([1, 3])
+        with col_t1:
+            tefca_purpose = st.text_input("Purpose of Use", "T-IAS")
+        with col_t2:
+            tefca_id_token = st.text_area(
+                "CLEAR id_token (from Accounts Team)",
+                value=st.session_state.get("tefca_id_token", ""),
+                height=80,
+                placeholder="eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJMYlJWOHJ1UmM3UzlxekZlWnpsS2ZneTc4SW11Y0RBbmhmczhuaVhwclciLCJnaXZlbl9uYW1lIjoiQ0FNSUxBIi4uLg..."
+            )
+            st.session_state["tefca_id_token"] = tefca_id_token
+
+        if not tefca_id_token:
+            st.markdown("""
+            <div class='warn-box'>
+            ⚠️ <strong>No id_token provided.</strong> For Epic Sandbox, this may still work 
+            (fake CSP tokens accepted). For SIT, you need the real CLEAR token from the Accounts Team.
+            Ask them for the token they generated for test patient Camila Lopez.
+            </div>
+            """, unsafe_allow_html=True)
+
     import urllib.parse
     params = {
         "response_type": "code",
@@ -296,6 +335,11 @@ elif step == 2:
         "state": state_val,
         "aud": aud,
     }
+    if include_tefca and tefca_purpose:
+        params["tefca_ias.purpose"] = tefca_purpose
+    if include_tefca and tefca_id_token:
+        params["tefca_ias.id_token"] = tefca_id_token
+
     full_url = auth_ep + "?" + urllib.parse.urlencode(params)
 
     st.markdown(f"<p class='code-label'>Generated Authorize URL</p>", unsafe_allow_html=True)
@@ -427,8 +471,15 @@ elif step == 4:
         alg = st.selectbox("Signing Algorithm", ["RS256", "RS384", "ES256", "ES384", "RS512"], index=0)
         st.session_state.key_algorithm = alg
         kid = st.text_input("Key ID (kid) — from your JWKS", st.session_state.kid,
-                           placeholder="696aeb4a-e264-4028-9881-8c8cba20eb7c")
+                           placeholder="6bd2d4b1-c99b-4eb2-99bc-5395e31dd6ad")
         st.session_state.kid = kid
+        if not kid.strip():
+            st.markdown("""
+            <div style='background:#fee2e2;border-left:4px solid #ef4444;border-radius:6px;padding:0.5rem 0.8rem;font-size:0.85rem;'>
+            🚨 <strong>kid is empty!</strong> You MUST set this or Epic will reject your JWT. 
+            Copy it from your JWKS or use Auto-Detect below.
+            </div>
+            """, unsafe_allow_html=True)
     with col2:
         jwks_url = st.text_input("JWKS URL (jku)", st.session_state.jwks_url)
         st.session_state.jwks_url = jwks_url
@@ -549,6 +600,56 @@ elif step == 4:
         "exp": now_ts + 300,
     }
 
+    # TEFCA IAS Extension in JWT
+    st.markdown("---")
+    st.markdown("#### 🔐 TEFCA IAS Extension in JWT Payload")
+    st.markdown("""
+    <div class='info-box'>
+    For TEFCA IAS, the JWT payload should include an <code>extensions</code> block with the 
+    CLEAR id_token and purpose of use. This tells Epic the patient has been identity-proofed.
+    </div>
+    """, unsafe_allow_html=True)
+
+    include_tefca_jwt = st.checkbox("Include TEFCA IAS extensions in JWT payload", value=True, key="tefca_jwt_toggle")
+
+    if include_tefca_jwt:
+        col_e1, col_e2 = st.columns(2)
+        with col_e1:
+            jwt_purpose = st.text_input("Purpose of Use", "T-IAS", key="jwt_purpose")
+            jwt_ial = st.selectbox("Identity Assurance Level", ["2", "1", "3"], index=0, key="jwt_ial")
+            jwt_verified_by = st.text_input("Verified By (CSP)", "CLEAR", key="jwt_csp")
+        with col_e2:
+            jwt_id_token = st.text_area(
+                "CLEAR id_token",
+                value=st.session_state.get("tefca_id_token", ""),
+                height=80,
+                placeholder="eyJhbGciOiJSUzI1NiJ9...",
+                key="jwt_tefca_token",
+            )
+
+        tefca_extension = {
+            "tefca_ias": {
+                "purpose_of_use": jwt_purpose,
+                "user_identity": {
+                    "ial": jwt_ial,
+                    "verified_by": jwt_verified_by,
+                },
+            }
+        }
+        if jwt_id_token.strip():
+            tefca_extension["tefca_ias"]["id_token"] = jwt_id_token.strip()
+
+        jwt_payload["extensions"] = tefca_extension
+
+        if not jwt_id_token.strip():
+            st.markdown("""
+            <div class='warn-box'>
+            ⚠️ <strong>No CLEAR id_token provided in JWT.</strong>
+            Epic Sandbox accepts fake/empty CSP tokens for testing.
+            SIT may require a real token — get it from the Accounts Team.
+            </div>
+            """, unsafe_allow_html=True)
+
     st.markdown("### JWT Claims Preview")
     c1, c2 = st.columns(2)
     with c1:
@@ -571,6 +672,19 @@ elif step == 4:
     if st.button("🔏 Sign JWT", type="primary"):
         if not private_key_input.strip():
             st.error("Please paste your private key above.")
+        elif not kid.strip():
+            st.error("""
+            ❌ **`kid` (Key ID) is required!** Without it, Epic can't find the right public key 
+            in your JWKS to verify the signature → `invalid_client`.
+            
+            **How to get it:**
+            1. Open your JWKS: `https://sit2-api.cvshealth.com/public/.well-known/jwks.json`
+            2. Find the key you're using
+            3. Copy its `"kid"` value exactly
+            4. Paste it in the **Key ID (kid)** field above
+            
+            Or paste the full JWKS JSON in the **Auto-Detect from JWKS** section above and click Apply.
+            """)
         else:
             try:
                 import jwt as pyjwt
