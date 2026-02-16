@@ -111,7 +111,7 @@ DEFAULTS = {
     "access_token": "",
     "patient_id": "",
     "private_key_pem": "",
-    "key_algorithm": "RS384",
+    "key_algorithm": "RS256",
     "kid": "",
     "authorize_endpoint": "",
     "token_endpoint": "",
@@ -414,9 +414,17 @@ elif step == 4:
     </div>
     """, unsafe_allow_html=True)
 
+    st.markdown("""
+    <div class='warn-box'>
+    ⚠️ <strong>Critical:</strong> The signing algorithm <strong>must match</strong> what's declared 
+    in your JWKS key (<code>"alg"</code> field). A mismatch (e.g., signing with RS384 when JWKS says RS256) 
+    will cause <code>invalid_grant</code>. Click <strong>Detect from JWKS</strong> below to auto-detect.
+    </div>
+    """, unsafe_allow_html=True)
+
     col1, col2 = st.columns(2)
     with col1:
-        alg = st.selectbox("Signing Algorithm", ["RS384", "ES256", "ES384", "RS256", "RS512"], index=0)
+        alg = st.selectbox("Signing Algorithm", ["RS256", "RS384", "ES256", "ES384", "RS512"], index=0)
         st.session_state.key_algorithm = alg
         kid = st.text_input("Key ID (kid) — from your JWKS", st.session_state.kid,
                            placeholder="696aeb4a-e264-4028-9881-8c8cba20eb7c")
@@ -426,6 +434,66 @@ elif step == 4:
         st.session_state.jwks_url = jwks_url
         token_ep = st.text_input("Token Endpoint (aud)", st.session_state.token_endpoint)
         st.session_state.token_endpoint = token_ep
+
+    # --- JWKS auto-detect ---
+    st.markdown("#### 🔍 Auto-Detect from JWKS")
+    st.caption("Paste your JWKS JSON below (the contents of your `.well-known/jwks.json`), and the app will auto-detect the algorithm, kid, and key type.")
+    jwks_raw = st.text_area(
+        "JWKS JSON (optional — for auto-detection):",
+        height=150,
+        placeholder='{\n  "keys": [\n    {\n      "kty": "RSA",\n      "kid": "696aeb4a-...",\n      "alg": "RS256",\n      "n": "...",\n      "e": "AQAB"\n    }\n  ]\n}',
+        key="jwks_detect_input",
+    )
+
+    if jwks_raw.strip():
+        try:
+            jwks_data = json.loads(jwks_raw)
+            keys_list = jwks_data.get("keys", [jwks_data] if "kty" in jwks_data else [])
+
+            if keys_list:
+                st.success(f"✅ Found **{len(keys_list)}** key(s) in JWKS")
+                for i, k in enumerate(keys_list):
+                    k_kid = k.get("kid", "—")
+                    k_alg = k.get("alg", "not specified")
+                    k_kty = k.get("kty", "—")
+                    k_use = k.get("use", "not specified")
+                    has_d = "d" in k
+                    key_label = f"Key {i+1}: kid=`{k_kid}` | kty=`{k_kty}` | alg=`{k_alg}` | use=`{k_use}` | {'🔐 private' if has_d else '🔓 public'}"
+                    st.markdown(f"- {key_label}")
+
+                # Auto-fill from first key (or key with matching kid)
+                target_key = keys_list[0]
+                if kid:
+                    matched = [k for k in keys_list if k.get("kid") == kid]
+                    if matched:
+                        target_key = matched[0]
+
+                detected_alg = target_key.get("alg", "")
+                detected_kid = target_key.get("kid", "")
+
+                if detected_alg:
+                    if detected_alg != alg:
+                        st.warning(
+                            f"⚠️ **Algorithm mismatch!** JWKS says `{detected_alg}` but you selected `{alg}`. "
+                            f"This WILL cause `invalid_grant`."
+                        )
+                    if st.button(f"✅ Apply detected settings (alg={detected_alg}, kid={detected_kid})", key="apply_jwks"):
+                        st.session_state.key_algorithm = detected_alg
+                        st.session_state.kid = detected_kid
+                        st.rerun()
+                else:
+                    st.info("No `alg` field in JWKS key. You'll need to set the algorithm manually based on the key type (`kty`).")
+                    kty = target_key.get("kty", "")
+                    if kty == "RSA":
+                        st.markdown("Key is RSA → use **RS256**, **RS384**, or **RS512**")
+                    elif kty == "EC":
+                        crv = target_key.get("crv", "")
+                        suggested = {"P-256": "ES256", "P-384": "ES384", "P-521": "ES512"}.get(crv, "ES256")
+                        st.markdown(f"Key is EC (curve: {crv}) → use **{suggested}**")
+            else:
+                st.warning("No keys found in the JSON.")
+        except json.JSONDecodeError:
+            st.error("Invalid JSON — paste the full JWKS response.")
 
     st.markdown("### 🔐 Private Key")
     st.markdown("""
