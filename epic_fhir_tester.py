@@ -1,0 +1,824 @@
+"""
+Epic FHIR TEFCA IAS — End-to-End Testing Navigator
+=====================================================
+Interactive Streamlit app for testing Epic Facilitated FHIR endpoints
+for the CVS IAS use case (Camila Lopez test patient).
+
+Steps covered:
+  1. SMART Discovery
+  2. Build OAuth Authorize URL
+  3. MyChart Login & Auth Code Capture
+  4. Generate Client Assertion JWT (with private key)
+  5. Token Exchange
+  6. Query FHIR Resources
+  7. View & Inspect Results
+"""
+
+import streamlit as st
+import json
+import time
+import uuid
+import base64
+import textwrap
+from datetime import datetime, timezone
+
+# ---------------------------------------------------------------------------
+# Page config
+# ---------------------------------------------------------------------------
+st.set_page_config(
+    page_title="Epic FHIR IAS Tester",
+    page_icon="🏥",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+# ---------------------------------------------------------------------------
+# Custom CSS
+# ---------------------------------------------------------------------------
+st.markdown("""
+<style>
+    .main .block-container { max-width: 1100px; padding-top: 1.5rem; }
+    .step-card {
+        background: linear-gradient(135deg, #f8f9fc 0%, #eef1f8 100%);
+        border-left: 4px solid #4A6CF7;
+        border-radius: 8px;
+        padding: 1.2rem 1.4rem;
+        margin-bottom: 1rem;
+    }
+    .step-card-active {
+        background: linear-gradient(135deg, #eef3ff 0%, #dbe6ff 100%);
+        border-left: 4px solid #2d4fd7;
+    }
+    .step-card-done {
+        background: linear-gradient(135deg, #edfcf2 0%, #d4f5e0 100%);
+        border-left: 4px solid #22c55e;
+    }
+    .warn-box {
+        background: #fff8e1;
+        border-left: 4px solid #f59e0b;
+        border-radius: 6px;
+        padding: 0.8rem 1rem;
+        margin: 0.5rem 0;
+        font-size: 0.92rem;
+    }
+    .info-box {
+        background: #e8f4fd;
+        border-left: 4px solid #3b82f6;
+        border-radius: 6px;
+        padding: 0.8rem 1rem;
+        margin: 0.5rem 0;
+        font-size: 0.92rem;
+    }
+    .code-label {
+        font-size: 0.78rem;
+        color: #6b7280;
+        margin-bottom: 2px;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+    }
+    div[data-testid="stSidebar"] {
+        background: linear-gradient(180deg, #1e293b 0%, #0f172a 100%);
+    }
+    div[data-testid="stSidebar"] .stMarkdown h1,
+    div[data-testid="stSidebar"] .stMarkdown h2,
+    div[data-testid="stSidebar"] .stMarkdown h3,
+    div[data-testid="stSidebar"] .stMarkdown p,
+    div[data-testid="stSidebar"] .stMarkdown li,
+    div[data-testid="stSidebar"] .stMarkdown label {
+        color: #e2e8f0 !important;
+    }
+    .patient-card {
+        background: #f0fdf4;
+        border: 1px solid #bbf7d0;
+        border-radius: 8px;
+        padding: 1rem;
+        margin: 0.5rem 0;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+# ---------------------------------------------------------------------------
+# Session state defaults
+# ---------------------------------------------------------------------------
+DEFAULTS = {
+    "current_step": 1,
+    "fhir_base_url": "https://fhir.epic.com/interconnect-fhir-oauth/api/FHIR/R4/",
+    "client_id": "6f7ca437-929b-4022-8bf5-c0af3fbe6bef",
+    "redirect_uri": "https://ddlqa.cvs.com/ul/extrecords",
+    "scopes": "patient/*.read launch/patient openid fhirUser",
+    "jwks_url": "https://sit2-api.cvshealth.com/public/.well-known/jwks.json",
+    "auth_code": "",
+    "access_token": "",
+    "patient_id": "",
+    "private_key_pem": "",
+    "key_algorithm": "RS384",
+    "kid": "",
+    "authorize_endpoint": "",
+    "token_endpoint": "",
+    "jwt_generated": "",
+    "token_response_raw": "",
+    "fhir_results": {},
+    "smart_config_raw": "",
+}
+for k, v in DEFAULTS.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
+
+# ---------------------------------------------------------------------------
+# Sidebar — navigation & config
+# ---------------------------------------------------------------------------
+with st.sidebar:
+    st.markdown("# 🏥 Epic FHIR Tester")
+    st.markdown("**TEFCA IAS — CVS Health**")
+    st.markdown("---")
+
+    steps = {
+        1: "📡  SMART Discovery",
+        2: "🔗  Build Authorize URL",
+        3: "🔑  MyChart Login & Code",
+        4: "📝  Generate JWT",
+        5: "🔄  Token Exchange",
+        6: "📋  Query FHIR Resources",
+        7: "📊  Results & Inspection",
+    }
+
+    st.markdown("### Navigation")
+    for num, label in steps.items():
+        is_current = st.session_state.current_step == num
+        prefix = "▶ " if is_current else "  "
+        if st.button(f"{prefix}{label}", key=f"nav_{num}", use_container_width=True):
+            st.session_state.current_step = num
+            st.rerun()
+
+    st.markdown("---")
+    st.markdown("### 🧪 Test Patient")
+    st.markdown("""
+    **LOPEZ, CAMILA MARIA**
+    - DOB: 09/12/1987
+    - Gender: Female
+    - Address: 3268 West Johnson St. Apt 117, Garland, TX 75043
+    - Phone: 469-555-5555
+    - Email: knixontestemail@epic.com
+    
+    **MyChart Login (try):**
+    - User: `fhircamila`
+    - Pass: `epicepic1`
+    """)
+
+    st.markdown("---")
+    st.markdown("### ⚙️ Environment")
+    env = st.selectbox("Target", ["Epic Sandbox (FHIR)", "SIT2"], index=0, label_visibility="collapsed")
+    if env == "SIT2":
+        st.session_state.fhir_base_url = st.text_input("FHIR Base URL", st.session_state.fhir_base_url)
+
+    st.markdown("---")
+    st.markdown("""
+    <div style='font-size:0.75rem;color:#94a3b8'>
+    ⚠️ Sandbox resets Mondays.<br>
+    Plan testing mid-week.<br><br>
+    Only the FHIR Sandbox<br>(urn:oid:1.2.840.114350.1.13.0.1.7.3.688884.100)<br>
+    supports the full OAuth + FHIR flow.
+    </div>
+    """, unsafe_allow_html=True)
+
+step = st.session_state.current_step
+
+# ===================================================================
+# STEP 1 — SMART Discovery
+# ===================================================================
+if step == 1:
+    st.markdown("## Step 1: SMART Discovery")
+    st.markdown("""
+    <div class='info-box'>
+    Hit the FHIR server's <code>.well-known/smart-configuration</code> endpoint to discover
+    the OAuth <strong>authorization</strong> and <strong>token</strong> URLs.
+    This is the starting point — everything else depends on these URLs.
+    </div>
+    """, unsafe_allow_html=True)
+
+    fhir_base = st.text_input("FHIR Base URL (from $match response)", st.session_state.fhir_base_url)
+    st.session_state.fhir_base_url = fhir_base
+    smart_url = fhir_base.rstrip("/") + "/.well-known/smart-configuration"
+
+    st.markdown(f"<p class='code-label'>Request</p>", unsafe_allow_html=True)
+    st.code(f"GET {smart_url}", language="http")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown("**How to run:** Open this URL in your browser or Postman. Copy the JSON response below.")
+
+    with col2:
+        st.markdown("""
+        <div class='warn-box'>
+        💡 <strong>Tip:</strong> In Postman, no auth headers needed for this call.
+        Just GET the URL and you'll get back the OAuth endpoint URLs.
+        </div>
+        """, unsafe_allow_html=True)
+
+    smart_json = st.text_area(
+        "Paste the smart-configuration JSON response here:",
+        value=st.session_state.smart_config_raw,
+        height=200,
+        placeholder='{\n  "authorization_endpoint": "https://fhir.epic.com/.../oauth2/authorize",\n  "token_endpoint": "https://fhir.epic.com/.../oauth2/token",\n  ...\n}'
+    )
+    st.session_state.smart_config_raw = smart_json
+
+    if smart_json.strip():
+        try:
+            config = json.loads(smart_json)
+            auth_ep = config.get("authorization_endpoint", "")
+            token_ep = config.get("token_endpoint", "")
+            st.session_state.authorize_endpoint = auth_ep
+            st.session_state.token_endpoint = token_ep
+            st.success(f"✅ Parsed successfully!")
+            c1, c2 = st.columns(2)
+            with c1:
+                st.text_input("Authorization Endpoint", auth_ep, disabled=True)
+            with c2:
+                st.text_input("Token Endpoint", token_ep, disabled=True)
+        except json.JSONDecodeError:
+            st.error("Invalid JSON — paste the full response from Postman/browser.")
+
+    if not st.session_state.authorize_endpoint:
+        st.markdown("**Or enter manually:**")
+        c1, c2 = st.columns(2)
+        with c1:
+            st.session_state.authorize_endpoint = st.text_input(
+                "Authorization Endpoint",
+                value="https://fhir.epic.com/interconnect-fhir-oauth/oauth2/authorize",
+                key="manual_auth_ep"
+            )
+        with c2:
+            st.session_state.token_endpoint = st.text_input(
+                "Token Endpoint",
+                value="https://fhir.epic.com/interconnect-fhir-oauth/oauth2/token",
+                key="manual_token_ep"
+            )
+
+    st.markdown("---")
+    if st.button("Next → Build Authorize URL", type="primary"):
+        st.session_state.current_step = 2
+        st.rerun()
+
+
+# ===================================================================
+# STEP 2 — Build Authorize URL
+# ===================================================================
+elif step == 2:
+    st.markdown("## Step 2: Build the OAuth Authorize URL")
+    st.markdown("""
+    <div class='info-box'>
+    Construct the URL that will redirect the test patient to Epic's MyChart login screen.
+    You paste this URL into your <strong>browser</strong> — not Postman.
+    </div>
+    """, unsafe_allow_html=True)
+
+    col1, col2 = st.columns(2)
+    with col1:
+        auth_ep = st.text_input("Authorization Endpoint", st.session_state.authorize_endpoint)
+        client_id = st.text_input("Client ID", st.session_state.client_id)
+        redirect_uri = st.text_input("Redirect URI", st.session_state.redirect_uri)
+    with col2:
+        scopes = st.text_input("Scopes", st.session_state.scopes)
+        state_val = st.text_input("State (any random string)", "test123")
+        aud = st.text_input("Audience (FHIR base URL)", st.session_state.fhir_base_url)
+
+    st.session_state.client_id = client_id
+    st.session_state.redirect_uri = redirect_uri
+    st.session_state.scopes = scopes
+
+    import urllib.parse
+    params = {
+        "response_type": "code",
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "scope": scopes,
+        "state": state_val,
+        "aud": aud,
+    }
+    full_url = auth_ep + "?" + urllib.parse.urlencode(params)
+
+    st.markdown(f"<p class='code-label'>Generated Authorize URL</p>", unsafe_allow_html=True)
+    st.code(full_url, language="text")
+
+    st.markdown("""
+    <div class='warn-box'>
+    📋 <strong>Copy this URL and paste it into your browser.</strong>
+    You'll see the Epic MyChart login screen. After logging in & approving,
+    you'll be redirected to the redirect URI with a <code>?code=XXX</code> parameter.
+    <br><br>
+    ⚠️ The page at the redirect URI <strong>won't load</strong> — that's expected!
+    Just grab the <code>code</code> value from the browser address bar.
+    </div>
+    """, unsafe_allow_html=True)
+
+    st.markdown("---")
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("← Back", key="b2"):
+            st.session_state.current_step = 1
+            st.rerun()
+    with c2:
+        if st.button("Next → MyChart Login & Code Capture", type="primary", key="n2"):
+            st.session_state.current_step = 3
+            st.rerun()
+
+
+# ===================================================================
+# STEP 3 — MyChart Login & Auth Code Capture
+# ===================================================================
+elif step == 3:
+    st.markdown("## Step 3: MyChart Login & Auth Code Capture")
+
+    st.markdown("""
+    <div class='patient-card'>
+    <strong>🧑‍⚕️ Test Patient: LOPEZ, CAMILA MARIA</strong><br>
+    DOB: 09/12/1987 &nbsp;|&nbsp; Gender: Female &nbsp;|&nbsp; Garland, TX 75043<br>
+    MyChart: <code>fhircamila</code> / <code>epicepic1</code>
+    &nbsp;(if that doesn't work, check <a href="https://fhir.epic.com/Documentation?docId=testpatients" target="_blank">Epic Sandbox Test Data</a>)
+    </div>
+    """, unsafe_allow_html=True)
+
+    st.markdown("""
+    ### What to do:
+    1. After pasting the Authorize URL in your browser, you should see the **MyChart login screen**
+    2. Enter the test patient credentials above
+    3. **Approve** the app when prompted (allow CVS to access records)
+    4. You'll be redirected — the page **won't load** (that's fine!)
+    5. **Quickly copy the entire URL** from the browser address bar
+    """)
+
+    redirect_url = st.text_input(
+        "Paste the full redirect URL from your browser:",
+        placeholder="https://ddlqa.cvs.com/ul/extrecords?code=XXXXXXXX&state=test123",
+    )
+
+    if redirect_url:
+        try:
+            parsed = urllib.parse.urlparse(redirect_url)
+            qs = urllib.parse.parse_qs(parsed.query)
+            code = qs.get("code", [""])[0]
+            if code:
+                st.session_state.auth_code = code
+                st.success(f"✅ Auth code extracted! (`{code[:20]}...`)")
+                st.markdown("""
+                <div class='warn-box'>
+                ⏱ <strong>This code expires in ~5 minutes!</strong>
+                Move to Step 4 (Generate JWT) quickly, or be prepared to redo this step for a fresh code.
+                </div>
+                """, unsafe_allow_html=True)
+            else:
+                st.error("No `code` parameter found in the URL. Make sure you copied the full redirect URL.")
+        except Exception as e:
+            st.error(f"Could not parse URL: {e}")
+
+    st.markdown("**Or paste just the auth code:**")
+    manual_code = st.text_input("Auth Code (manual)", st.session_state.auth_code, key="manual_code")
+    st.session_state.auth_code = manual_code
+
+    st.markdown("---")
+
+    st.markdown("""
+    <div class='warn-box'>
+    🔄 <strong>Alternative: Network Tab Trick</strong><br>
+    Open Chrome DevTools (F12) → Network tab <em>before</em> clicking the authorize URL.
+    After MyChart login & approval, the redirect will show in the Network tab even
+    if the page doesn't load. Look for the request to your redirect URI and grab the
+    <code>code</code> from its query parameters.
+    </div>
+    """, unsafe_allow_html=True)
+
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("← Back", key="b3"):
+            st.session_state.current_step = 2
+            st.rerun()
+    with c2:
+        if st.button("Next → Generate JWT", type="primary", key="n3"):
+            st.session_state.current_step = 4
+            st.rerun()
+
+
+# ===================================================================
+# STEP 4 — Generate Client Assertion JWT
+# ===================================================================
+elif step == 4:
+    st.markdown("## Step 4: Generate Client Assertion JWT")
+    st.markdown("""
+    <div class='info-box'>
+    Epic uses <strong>asymmetric JWT authentication</strong> (SMART Backend Services).
+    You sign a JWT with your <strong>private key</strong>; Epic verifies it against
+    the public key at your <strong>JWKS URI</strong>.
+    <br><br>
+    Your SIT JWKS: <code>sit2-api.cvshealth.com/public/.well-known/jwks.json</code>
+    </div>
+    """, unsafe_allow_html=True)
+
+    col1, col2 = st.columns(2)
+    with col1:
+        alg = st.selectbox("Signing Algorithm", ["RS384", "ES256", "ES384", "RS256", "RS512"], index=0)
+        st.session_state.key_algorithm = alg
+        kid = st.text_input("Key ID (kid) — from your JWKS", st.session_state.kid,
+                           placeholder="696aeb4a-e264-4028-9881-8c8cba20eb7c")
+        st.session_state.kid = kid
+    with col2:
+        jwks_url = st.text_input("JWKS URL (jku)", st.session_state.jwks_url)
+        st.session_state.jwks_url = jwks_url
+        token_ep = st.text_input("Token Endpoint (aud)", st.session_state.token_endpoint)
+        st.session_state.token_endpoint = token_ep
+
+    st.markdown("### 🔐 Private Key")
+    st.markdown("""
+    <div class='warn-box'>
+    ⚠️ <strong>Security:</strong> This key stays local in your Streamlit session.
+    Never share private keys via email / Slack. If you're uncomfortable pasting here,
+    use the generated JWT claims below and sign using your own tooling (openssl, jwt.io offline, etc.)
+    </div>
+    """, unsafe_allow_html=True)
+
+    private_key_input = st.text_area(
+        "Paste your PEM private key (RSA or EC):",
+        value=st.session_state.private_key_pem,
+        height=200,
+        placeholder="-----BEGIN PRIVATE KEY-----\nMIIEvgIBADANBg...\n-----END PRIVATE KEY-----",
+    )
+    st.session_state.private_key_pem = private_key_input
+
+    # Show the JWT claims regardless
+    now_ts = int(time.time())
+    jti_val = str(uuid.uuid4())
+    jwt_header = {
+        "alg": alg,
+        "typ": "JWT",
+        "kid": kid if kid else "<your-key-id>",
+        "jku": jwks_url,
+    }
+    jwt_payload = {
+        "iss": st.session_state.client_id,
+        "sub": st.session_state.client_id,
+        "aud": token_ep,
+        "jti": jti_val,
+        "nbf": now_ts,
+        "iat": now_ts,
+        "exp": now_ts + 300,
+    }
+
+    st.markdown("### JWT Claims Preview")
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("<p class='code-label'>Header</p>", unsafe_allow_html=True)
+        st.json(jwt_header)
+    with c2:
+        st.markdown("<p class='code-label'>Payload</p>", unsafe_allow_html=True)
+        st.json(jwt_payload)
+
+    st.markdown(f"""
+    <div class='info-box'>
+    <strong>Timestamps (current):</strong><br>
+    • <code>iat/nbf</code> = {now_ts} ({datetime.fromtimestamp(now_ts, tz=timezone.utc).isoformat()})<br>
+    • <code>exp</code> = {now_ts + 300} (5 minutes from now)<br>
+    • <code>jti</code> = {jti_val} (unique per request, max 151 chars)
+    </div>
+    """, unsafe_allow_html=True)
+
+    # Attempt to sign if private key is provided
+    if st.button("🔏 Sign JWT", type="primary"):
+        if not private_key_input.strip():
+            st.error("Please paste your private key above.")
+        else:
+            try:
+                import jwt as pyjwt
+
+                jwt_token = pyjwt.encode(
+                    jwt_payload,
+                    private_key_input.strip(),
+                    algorithm=alg,
+                    headers={"kid": kid, "jku": jwks_url, "typ": "JWT"},
+                )
+                st.session_state.jwt_generated = jwt_token
+                st.success("✅ JWT signed successfully!")
+            except Exception as e:
+                st.error(f"JWT signing failed: {e}")
+                st.markdown("""
+                **Common issues:**
+                - Wrong algorithm for key type (RS384 needs RSA key, ES256 needs EC key)
+                - Key is in wrong format (needs PEM with `-----BEGIN ... KEY-----`)
+                - Key is encrypted (provide unencrypted PEM)
+                """)
+
+    if st.session_state.jwt_generated:
+        st.markdown("<p class='code-label'>Signed client_assertion JWT</p>", unsafe_allow_html=True)
+        st.code(st.session_state.jwt_generated, language="text")
+
+        # Decode and show parts
+        parts = st.session_state.jwt_generated.split(".")
+        if len(parts) == 3:
+            st.markdown("**JWT Breakdown:**")
+            for i, (label, part) in enumerate(zip(["Header", "Payload", "Signature"], parts)):
+                if i < 2:
+                    try:
+                        padded = part + "=" * (4 - len(part) % 4)
+                        decoded = json.loads(base64.urlsafe_b64decode(padded))
+                        with st.expander(f"📦 {label}"):
+                            st.json(decoded)
+                    except Exception:
+                        pass
+
+    st.markdown("---")
+
+    st.markdown("""
+    ### ⚠️ Common Mistakes (from Epic docs)
+    - `iat` and `nbf` must **NOT** be in the future
+    - `exp` must be **in the future** but no more than 5 min after `iat`
+    - `jti` must be max **151 characters**
+    - Use `client_assertion` (underscore), **NOT** `client-assertion` (hyphen)
+    - Don't double-encode the `client_assertion_type` value
+    - Private key must match public key at your registered JWK Set URL
+    - After uploading a new key, it can take up to **60 minutes** to sync with Sandbox
+    """)
+
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("← Back", key="b4"):
+            st.session_state.current_step = 3
+            st.rerun()
+    with c2:
+        if st.button("Next → Token Exchange", type="primary", key="n4"):
+            st.session_state.current_step = 5
+            st.rerun()
+
+
+# ===================================================================
+# STEP 5 — Token Exchange
+# ===================================================================
+elif step == 5:
+    st.markdown("## Step 5: Token Exchange")
+    st.markdown("""
+    <div class='info-box'>
+    Exchange the <strong>auth code</strong> + <strong>signed JWT</strong> for an
+    <strong>access token</strong>. This is a Postman / cURL call — NOT a browser redirect.
+    </div>
+    """, unsafe_allow_html=True)
+
+    token_ep = st.text_input("Token Endpoint", st.session_state.token_endpoint)
+    auth_code = st.text_input("Auth Code (from Step 3)", st.session_state.auth_code)
+    redirect_uri = st.text_input("Redirect URI", st.session_state.redirect_uri, key="redir5")
+    jwt_val = st.text_area("Client Assertion JWT (from Step 4)", st.session_state.jwt_generated, height=100)
+
+    st.markdown("### Postman Setup")
+    st.markdown(f"<p class='code-label'>POST Request</p>", unsafe_allow_html=True)
+
+    postman_body = {
+        "grant_type": "authorization_code",
+        "code": auth_code if auth_code else "<AUTH_CODE_FROM_STEP_3>",
+        "redirect_uri": redirect_uri,
+        "client_assertion_type": "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+        "client_assertion": (jwt_val[:50] + "...") if jwt_val else "<JWT_FROM_STEP_4>",
+    }
+
+    st.markdown(f"""
+    **URL:** `POST {token_ep}`
+    
+    **Headers:**
+    | Key | Value |
+    |-----|-------|
+    | Content-Type | `application/x-www-form-urlencoded` |
+    
+    **Body (x-www-form-urlencoded):**
+    """)
+
+    for k, v in postman_body.items():
+        st.code(f"{k} = {v}", language="text")
+
+    # cURL equivalent
+    curl_cmd = f"""curl -X POST "{token_ep}" \\
+  -H "Content-Type: application/x-www-form-urlencoded" \\
+  -d "grant_type=authorization_code" \\
+  -d "code={auth_code or '<AUTH_CODE>'}" \\
+  -d "redirect_uri={redirect_uri}" \\
+  -d "client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer" \\
+  -d "client_assertion={(jwt_val[:60] + '...') if jwt_val else '<SIGNED_JWT>'}" """
+
+    with st.expander("📋 cURL Command"):
+        st.code(curl_cmd, language="bash")
+
+    st.markdown("### Response")
+    st.markdown("Paste the token response JSON from Postman:")
+    token_resp = st.text_area(
+        "Token Response JSON",
+        value=st.session_state.token_response_raw,
+        height=180,
+        placeholder='{\n  "access_token": "eyJ...",\n  "token_type": "Bearer",\n  "expires_in": 3600,\n  "patient": "eABcDeFg...",\n  "scope": "patient/*.read openid fhirUser"\n}'
+    )
+    st.session_state.token_response_raw = token_resp
+
+    if token_resp.strip():
+        try:
+            resp = json.loads(token_resp)
+            st.session_state.access_token = resp.get("access_token", "")
+            st.session_state.patient_id = resp.get("patient", "")
+            st.success("✅ Token response parsed!")
+
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                st.metric("Token Type", resp.get("token_type", "—"))
+            with c2:
+                exp = resp.get("expires_in", "—")
+                st.metric("Expires In", f"{exp}s" if exp != "—" else "—")
+            with c3:
+                st.metric("Patient ID", st.session_state.patient_id[:20] + "..." if len(st.session_state.patient_id) > 20 else st.session_state.patient_id or "—")
+
+            if st.session_state.access_token:
+                with st.expander("🔑 Access Token"):
+                    st.code(st.session_state.access_token, language="text")
+        except json.JSONDecodeError:
+            st.error("Invalid JSON.")
+
+    st.markdown("---")
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("← Back", key="b5"):
+            st.session_state.current_step = 4
+            st.rerun()
+    with c2:
+        if st.button("Next → Query FHIR Resources", type="primary", key="n5"):
+            st.session_state.current_step = 6
+            st.rerun()
+
+
+# ===================================================================
+# STEP 6 — Query FHIR Resources
+# ===================================================================
+elif step == 6:
+    st.markdown("## Step 6: Query FHIR Resources")
+    st.markdown("""
+    <div class='info-box'>
+    Use the <strong>access token</strong> as a Bearer token to query Camila's health records.
+    Run these in Postman with <code>Authorization: Bearer &lt;token&gt;</code>.
+    </div>
+    """, unsafe_allow_html=True)
+
+    fhir_base = st.session_state.fhir_base_url.rstrip("/")
+    patient_id = st.text_input("Patient ID (from token response)", st.session_state.patient_id)
+    access_token = st.text_input("Access Token", st.session_state.access_token[:40] + "..." if len(st.session_state.access_token) > 40 else st.session_state.access_token, disabled=True)
+
+    resources = [
+        ("Patient", f"Patient/{patient_id}", "Demographics, identifiers, addresses"),
+        ("DocumentReference", f"DocumentReference?patient={patient_id}", "Clinical documents (C-CDA, discharge summaries)"),
+        ("Condition", f"Condition?patient={patient_id}", "Diagnoses and problems"),
+        ("AllergyIntolerance", f"AllergyIntolerance?patient={patient_id}", "Allergies and adverse reactions"),
+        ("MedicationRequest", f"MedicationRequest?patient={patient_id}", "Prescriptions and medication orders"),
+        ("Immunization", f"Immunization?patient={patient_id}", "Vaccination records"),
+        ("Observation", f"Observation?patient={patient_id}&category=vital-signs", "Vital signs (BP, weight, etc.)"),
+        ("Observation (Labs)", f"Observation?patient={patient_id}&category=laboratory", "Lab results"),
+        ("Encounter", f"Encounter?patient={patient_id}", "Visits and encounters"),
+        ("Procedure", f"Procedure?patient={patient_id}", "Surgical and clinical procedures"),
+    ]
+
+    st.markdown("### Available FHIR Queries")
+    for name, path, desc in resources:
+        full_url = f"{fhir_base}/{path}"
+        with st.expander(f"📄 {name} — {desc}"):
+            st.markdown(f"<p class='code-label'>GET Request</p>", unsafe_allow_html=True)
+            st.code(f"GET {full_url}\nAuthorization: Bearer <access_token>\nAccept: application/fhir+json", language="http")
+
+            curl = f"""curl -s "{full_url}" \\
+  -H "Authorization: Bearer {st.session_state.access_token[:30] + '...' if st.session_state.access_token else '<ACCESS_TOKEN>'}" \\
+  -H "Accept: application/fhir+json" | python3 -m json.tool"""
+            st.code(curl, language="bash")
+
+            # Paste results
+            res_json = st.text_area(
+                f"Paste {name} response:",
+                value=st.session_state.fhir_results.get(name, ""),
+                height=150,
+                key=f"res_{name}"
+            )
+            if res_json.strip():
+                st.session_state.fhir_results[name] = res_json
+                try:
+                    parsed = json.loads(res_json)
+                    total = parsed.get("total", parsed.get("id", "—"))
+                    rtype = parsed.get("resourceType", "—")
+                    st.success(f"✅ {rtype} — {f'Total: {total}' if isinstance(total, int) else f'ID: {total}'}")
+                except json.JSONDecodeError:
+                    st.error("Invalid JSON")
+
+    st.markdown("---")
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("← Back", key="b6"):
+            st.session_state.current_step = 5
+            st.rerun()
+    with c2:
+        if st.button("Next → Results & Inspection", type="primary", key="n6"):
+            st.session_state.current_step = 7
+            st.rerun()
+
+
+# ===================================================================
+# STEP 7 — Results & Inspection
+# ===================================================================
+elif step == 7:
+    st.markdown("## Step 7: Results Summary & Inspection")
+
+    # Progress tracker
+    st.markdown("### 🗺️ End-to-End Flow Status")
+    checks = {
+        "SMART Discovery": bool(st.session_state.authorize_endpoint and st.session_state.token_endpoint),
+        "Authorize URL Built": bool(st.session_state.client_id),
+        "Auth Code Captured": bool(st.session_state.auth_code),
+        "JWT Generated": bool(st.session_state.jwt_generated),
+        "Token Exchanged": bool(st.session_state.access_token),
+        "FHIR Data Retrieved": bool(st.session_state.fhir_results),
+    }
+
+    cols = st.columns(len(checks))
+    for col, (label, done) in zip(cols, checks.items()):
+        with col:
+            icon = "✅" if done else "⬜"
+            st.markdown(f"**{icon}**\n\n{label}")
+
+    completed = sum(checks.values())
+    st.progress(completed / len(checks), text=f"{completed}/{len(checks)} steps completed")
+
+    # Summary of collected data
+    if st.session_state.fhir_results:
+        st.markdown("### 📊 Retrieved FHIR Resources")
+        for name, data in st.session_state.fhir_results.items():
+            if data.strip():
+                try:
+                    parsed = json.loads(data)
+                    rtype = parsed.get("resourceType", "Unknown")
+
+                    if rtype == "Bundle":
+                        total = parsed.get("total", len(parsed.get("entry", [])))
+                        st.markdown(f"**{name}:** {total} record(s)")
+                        if parsed.get("entry"):
+                            with st.expander(f"View {name} entries"):
+                                for i, entry in enumerate(parsed["entry"][:10]):
+                                    resource = entry.get("resource", {})
+                                    st.json(resource)
+                    else:
+                        st.markdown(f"**{name}:** Single resource")
+                        with st.expander(f"View {name}"):
+                            st.json(parsed)
+                except json.JSONDecodeError:
+                    st.warning(f"{name}: Invalid JSON")
+
+    # Key configuration summary
+    st.markdown("### 🔧 Configuration Summary")
+    config_data = {
+        "FHIR Base URL": st.session_state.fhir_base_url,
+        "Client ID": st.session_state.client_id,
+        "Redirect URI": st.session_state.redirect_uri,
+        "JWKS URL": st.session_state.jwks_url,
+        "Key Algorithm": st.session_state.key_algorithm,
+        "Key ID (kid)": st.session_state.kid or "—",
+        "Authorization Endpoint": st.session_state.authorize_endpoint,
+        "Token Endpoint": st.session_state.token_endpoint,
+        "Patient ID": st.session_state.patient_id or "—",
+    }
+    for label, val in config_data.items():
+        st.text_input(label, val, disabled=True, key=f"summary_{label}")
+
+    # Architecture context
+    st.markdown("---")
+    st.markdown("### 📐 Architecture Context (from your past discussions)")
+    st.markdown("""
+    **End-to-End CVS IAS Flow:**
+    
+    1. **CLEAR Identity Proofing** → Patient scans DL + selfie → OIDC id_token (IAL2)
+       *(Accounts Team owns CLEAR integration)*
+    
+    2. **Patient $match via CommonWell** → CDR Team sends demographics → CommonWell broadcasts XCPD
+       → Epic Nexus responds with Patient + Organization + Endpoint resources
+       *(CDR Team's entire scope)*
+    
+    3. **Facilitated FHIR per-site** → For each matched hospital:
+       SMART Discovery → OAuth Authorize (MyChart login) → Token Exchange → FHIR Queries
+       *(APP Team's scope — this is what you're testing here)*
+    
+    **Key findings from your $match testing:**
+    - Match 1: **Epic FHIR Sandbox** (Verona, WI) — full OAuth+FHIR supported ✅
+    - Match 2: **Health Gorilla** (Coral Gables, FL) — different QHIN, no endpoint returned ❌
+    - Both responses confirm cross-QHIN discovery is working via CommonWell
+    
+    **SIT Environment:**
+    - JWKS URI: `sit2-api.cvshealth.com/public/.well-known/jwks.json`
+    - Your existing Epic App Orchard integration uses ES256
+    - Epic Nexus (TEFCA IAS) recommends RS384 — confirm with Tyler Steier
+    """)
+
+    st.markdown("---")
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("← Back to FHIR Queries", key="b7"):
+            st.session_state.current_step = 6
+            st.rerun()
+    with c2:
+        if st.button("🔄 Restart from Step 1", key="restart"):
+            for k, v in DEFAULTS.items():
+                st.session_state[k] = v
+            st.session_state.current_step = 1
+            st.rerun()
