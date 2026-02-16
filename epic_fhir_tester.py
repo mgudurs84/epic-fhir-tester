@@ -436,11 +436,29 @@ elif step == 4:
     </div>
     """, unsafe_allow_html=True)
 
+    key_format = st.radio(
+        "What format is your private key in?",
+        ["PEM (-----BEGIN PRIVATE KEY-----)", "JWK JSON ({\"kty\": \"RSA\", ...})", "Raw Base64 (no headers)"],
+        index=0,
+        horizontal=True,
+    )
+
+    if "JWK" in key_format:
+        placeholder_text = '{\n  "kty": "RSA",\n  "kid": "696aeb4a-...",\n  "n": "0vx7agoebGc...",\n  "e": "AQAB",\n  "d": "X4cTteJY_gn...",\n  "p": "...",\n  "q": "...",\n  "dp": "...",\n  "dq": "...",\n  "qi": "..."\n}'
+        help_text = "Paste the **private** JWK object (must contain the `d` parameter). If you have a JWKS with a `keys` array, paste just the single key object that has the `d` field."
+    elif "Raw" in key_format:
+        placeholder_text = "MIIEvgIBADANBgkqhkiG9w0BAQEFAASC..."
+        help_text = "Paste the base64 key material without `-----BEGIN/END-----` headers. The app will auto-wrap it."
+    else:
+        placeholder_text = "-----BEGIN PRIVATE KEY-----\nMIIEvgIBADANBg...\n-----END PRIVATE KEY-----"
+        help_text = "Standard PEM format. Accepts PKCS#8 (`BEGIN PRIVATE KEY`) or PKCS#1 (`BEGIN RSA PRIVATE KEY` / `BEGIN EC PRIVATE KEY`)."
+
+    st.caption(help_text)
     private_key_input = st.text_area(
-        "Paste your PEM private key (RSA or EC):",
+        "Paste your private key:",
         value=st.session_state.private_key_pem,
         height=200,
-        placeholder="-----BEGIN PRIVATE KEY-----\nMIIEvgIBADANBg...\n-----END PRIVATE KEY-----",
+        placeholder=placeholder_text,
     )
     st.session_state.private_key_pem = private_key_input
 
@@ -488,22 +506,258 @@ elif step == 4:
         else:
             try:
                 import jwt as pyjwt
+                from cryptography.hazmat.primitives import serialization
+                from cryptography.hazmat.primitives.asymmetric import rsa as rsa_mod, ec as ec_mod
+                from cryptography.hazmat.backends import default_backend
+
+                raw_key = private_key_input.strip()
+                private_key_obj = None
+
+                # ── FORMAT A: JWK JSON ───────────────────────────────
+                if "JWK" in key_format or raw_key.lstrip().startswith("{"):
+                    try:
+                        jwk_data = json.loads(raw_key)
+
+                        # Handle JWKS wrapper ({"keys": [...]})
+                        if "keys" in jwk_data and isinstance(jwk_data["keys"], list):
+                            # Find the key with "d" (private component)
+                            priv_keys = [k for k in jwk_data["keys"] if "d" in k]
+                            if not priv_keys:
+                                raise ValueError(
+                                    "JWKS contains only public keys (no 'd' parameter). "
+                                    "You need the **private** key, not the public JWKS."
+                                )
+                            jwk_data = priv_keys[0]
+                            st.info(f"📌 Found private key in JWKS array (kid: `{jwk_data.get('kid', 'n/a')}`)")
+
+                        if "d" not in jwk_data:
+                            raise ValueError(
+                                "This JWK has no `d` parameter — it's a **public** key. "
+                                "The private key JWK must include `d` (and `p`, `q`, `dp`, `dq`, `qi` for RSA)."
+                            )
+
+                        # Auto-extract kid from JWK if not set
+                        if not kid and jwk_data.get("kid"):
+                            kid = jwk_data["kid"]
+                            st.session_state.kid = kid
+                            st.info(f"📌 Auto-detected `kid` from JWK: `{kid}`")
+
+                        kty = jwk_data.get("kty", "").upper()
+
+                        if kty == "RSA":
+                            from cryptography.hazmat.primitives.asymmetric.rsa import RSAPrivateNumbers, RSAPublicNumbers
+
+                            def _b64_to_int(val):
+                                val += "=" * (4 - len(val) % 4)
+                                return int.from_bytes(base64.urlsafe_b64decode(val), "big")
+
+                            public_numbers = RSAPublicNumbers(
+                                e=_b64_to_int(jwk_data["e"]),
+                                n=_b64_to_int(jwk_data["n"]),
+                            )
+                            private_key_obj = RSAPrivateNumbers(
+                                p=_b64_to_int(jwk_data["p"]),
+                                q=_b64_to_int(jwk_data["q"]),
+                                d=_b64_to_int(jwk_data["d"]),
+                                dmp1=_b64_to_int(jwk_data["dp"]),
+                                dmq1=_b64_to_int(jwk_data["dq"]),
+                                iqmp=_b64_to_int(jwk_data["qi"]),
+                                public_numbers=public_numbers,
+                            ).private_key(default_backend())
+
+                        elif kty == "EC":
+                            from cryptography.hazmat.primitives.asymmetric.ec import (
+                                EllipticCurvePrivateNumbers, EllipticCurvePublicNumbers,
+                                SECP256R1, SECP384R1, SECP521R1,
+                            )
+                            crv_map = {
+                                "P-256": SECP256R1(), "P-384": SECP384R1(), "P-521": SECP521R1(),
+                            }
+                            crv = crv_map.get(jwk_data.get("crv"))
+                            if not crv:
+                                raise ValueError(f"Unsupported EC curve: {jwk_data.get('crv')}")
+
+                            def _b64_to_int(val):
+                                val += "=" * (4 - len(val) % 4)
+                                return int.from_bytes(base64.urlsafe_b64decode(val), "big")
+
+                            public_numbers = EllipticCurvePublicNumbers(
+                                x=_b64_to_int(jwk_data["x"]),
+                                y=_b64_to_int(jwk_data["y"]),
+                                curve=crv,
+                            )
+                            private_key_obj = EllipticCurvePrivateNumbers(
+                                private_value=_b64_to_int(jwk_data["d"]),
+                                public_numbers=public_numbers,
+                            ).private_key(default_backend())
+
+                        else:
+                            raise ValueError(f"Unsupported JWK key type: {kty}")
+
+                    except json.JSONDecodeError:
+                        raise ValueError(
+                            "Key looks like JSON but couldn't be parsed. "
+                            "Check for trailing commas, missing quotes, or truncation."
+                        )
+
+                # ── FORMAT B: Raw Base64 (no PEM headers) ────────────
+                elif "Raw" in key_format or (
+                    not raw_key.startswith("-----") and not raw_key.startswith("{")
+                ):
+                    # Clean up whitespace and try to decode as DER
+                    b64_clean = raw_key.replace("\n", "").replace("\r", "").replace(" ", "").replace("\t", "")
+
+                    # Try wrapping as PKCS#8 PEM first
+                    wrapped = "\n".join([b64_clean[i:i+64] for i in range(0, len(b64_clean), 64)])
+
+                    for header_type in ["PRIVATE KEY", "RSA PRIVATE KEY", "EC PRIVATE KEY"]:
+                        pem_candidate = f"-----BEGIN {header_type}-----\n{wrapped}\n-----END {header_type}-----"
+                        try:
+                            private_key_obj = serialization.load_pem_private_key(
+                                pem_candidate.encode(), password=None, backend=default_backend()
+                            )
+                            st.info(f"📌 Key auto-wrapped as `{header_type}` PEM")
+                            break
+                        except Exception:
+                            continue
+
+                    if private_key_obj is None:
+                        # Try raw DER
+                        try:
+                            der_bytes = base64.b64decode(b64_clean)
+                            private_key_obj = serialization.load_der_private_key(
+                                der_bytes, password=None, backend=default_backend()
+                            )
+                            st.info("📌 Key loaded as raw DER")
+                        except Exception:
+                            raise ValueError(
+                                "Could not decode the raw base64 as a private key. "
+                                "Make sure you pasted the complete key material."
+                            )
+
+                # ── FORMAT C: PEM ────────────────────────────────────
+                else:
+                    # Fix common paste issues (collapsed newlines, etc.)
+                    for tag in [
+                        "RSA PRIVATE KEY", "PRIVATE KEY", "EC PRIVATE KEY",
+                    ]:
+                        begin = f"-----BEGIN {tag}-----"
+                        end   = f"-----END {tag}-----"
+                        if begin in raw_key and end in raw_key:
+                            header_part = raw_key[raw_key.index(begin) + len(begin):raw_key.index(end)].strip()
+                            b64_clean = header_part.replace("\n", "").replace("\r", "").replace(" ", "").replace("\t", "")
+                            wrapped = "\n".join([b64_clean[i:i+64] for i in range(0, len(b64_clean), 64)])
+                            raw_key = f"{begin}\n{wrapped}\n{end}"
+                            break
+
+                    # Also handle \\n (literal backslash-n from JSON / Secret Manager)
+                    if "\\n" in raw_key:
+                        raw_key = raw_key.replace("\\n", "\n")
+
+                    key_bytes = raw_key.encode("utf-8")
+                    try:
+                        private_key_obj = serialization.load_pem_private_key(
+                            key_bytes, password=None, backend=default_backend()
+                        )
+                    except Exception as load_err:
+                        # Try DER as fallback
+                        try:
+                            raw_b64 = raw_key
+                            for rem in ["-----BEGIN PRIVATE KEY-----", "-----END PRIVATE KEY-----",
+                                        "-----BEGIN RSA PRIVATE KEY-----", "-----END RSA PRIVATE KEY-----",
+                                        "-----BEGIN EC PRIVATE KEY-----", "-----END EC PRIVATE KEY-----"]:
+                                raw_b64 = raw_b64.replace(rem, "")
+                            raw_b64 = raw_b64.replace("\n", "").replace("\r", "").replace(" ", "")
+                            der_bytes = base64.b64decode(raw_b64)
+                            private_key_obj = serialization.load_der_private_key(
+                                der_bytes, password=None, backend=default_backend()
+                            )
+                        except Exception:
+                            raise load_err
+
+                if private_key_obj is None:
+                    raise ValueError("Could not load the key in any supported format.")
+
+                # ── Detect key type & validate algorithm match ───────
+                is_rsa = isinstance(private_key_obj, rsa_mod.RSAPrivateKey)
+                is_ec  = isinstance(private_key_obj, ec_mod.EllipticCurvePrivateKey)
+
+                rsa_algs = {"RS256", "RS384", "RS512", "PS256", "PS384", "PS512"}
+                ec_algs  = {"ES256", "ES384", "ES512"}
+
+                if is_rsa and alg not in rsa_algs:
+                    st.warning(
+                        f"⚠️ You have an **RSA** key but selected **{alg}** (EC algorithm). "
+                        f"Switching to **RS384** (Epic recommended)."
+                    )
+                    alg = "RS384"
+                    st.session_state.key_algorithm = alg
+                elif is_ec and alg not in ec_algs:
+                    curve_name = private_key_obj.curve.name
+                    auto_alg = {
+                        "secp256r1": "ES256",
+                        "secp384r1": "ES384",
+                        "secp521r1": "ES512",
+                    }.get(curve_name, "ES256")
+                    st.warning(
+                        f"⚠️ You have an **EC ({curve_name})** key but selected **{alg}** (RSA algorithm). "
+                        f"Switching to **{auto_alg}**."
+                    )
+                    alg = auto_alg
+                    st.session_state.key_algorithm = alg
+
+                # ── Re-serialize to clean PKCS8 PEM for PyJWT ────────
+                clean_pem = private_key_obj.private_bytes(
+                    encoding=serialization.Encoding.PEM,
+                    format=serialization.PrivateFormat.PKCS8,
+                    encryption_algorithm=serialization.NoEncryption(),
+                )
+
+                # ── Refresh timestamps so JWT is fresh ───────────────
+                now_fresh = int(time.time())
+                jwt_payload_fresh = {
+                    **jwt_payload,
+                    "nbf": now_fresh,
+                    "iat": now_fresh,
+                    "exp": now_fresh + 300,
+                    "jti": str(uuid.uuid4()),
+                }
 
                 jwt_token = pyjwt.encode(
-                    jwt_payload,
-                    private_key_input.strip(),
+                    jwt_payload_fresh,
+                    clean_pem,
                     algorithm=alg,
                     headers={"kid": kid, "jku": jwks_url, "typ": "JWT"},
                 )
                 st.session_state.jwt_generated = jwt_token
-                st.success("✅ JWT signed successfully!")
+                key_type = "RSA" if is_rsa else f"EC ({private_key_obj.curve.name})" if is_ec else "Unknown"
+                key_bits = private_key_obj.key_size if hasattr(private_key_obj, 'key_size') else "?"
+                st.success(f"✅ JWT signed successfully!  (Key: **{key_type} {key_bits}-bit**, Algorithm: **{alg}**)")
+
             except Exception as e:
                 st.error(f"JWT signing failed: {e}")
-                st.markdown("""
-                **Common issues:**
-                - Wrong algorithm for key type (RS384 needs RSA key, ES256 needs EC key)
-                - Key is in wrong format (needs PEM with `-----BEGIN ... KEY-----`)
-                - Key is encrypted (provide unencrypted PEM)
+                st.markdown(f"""
+                **Troubleshooting checklist:**
+
+                1. **Is this actually a private key?** It must contain the secret `d` component.
+                   A public key (from your JWKS endpoint) won't work for signing.
+
+                2. **JWK format** — if your key is JSON, it must have fields like `"d"`, `"p"`, `"q"` (RSA) 
+                   or `"d"`, `"x"`, `"y"` (EC). If it only has `"n"` and `"e"` — that's the public key.
+
+                3. **Raw base64** — select "Raw Base64" format above and paste just the base64 
+                   characters (no headers, no JSON wrapper).
+
+                4. **GCP Secret Manager** — keys exported from GCP often have `\\n` as literal text. 
+                   The app handles this, but double-check for extra escaping.
+
+                5. **Key must not be encrypted** — if your PEM has `Proc-Type: 4,ENCRYPTED`, 
+                   decrypt first: `openssl rsa -in encrypted.pem -out decrypted.pem`
+
+                6. **Match key type to algorithm:**
+                   - RSA key → RS256, RS384, RS512
+                   - EC P-256 key → ES256
+                   - EC P-384 key → ES384
                 """)
 
     if st.session_state.jwt_generated:
