@@ -1038,249 +1038,358 @@ elif step == 5:
     with st.expander("📋 cURL Command"):
         st.code(curl_cmd, language="bash")
 
-    st.markdown("### Response")
-    st.markdown("Paste the token response JSON from Postman:")
-    token_resp = st.text_area(
-        "Token Response JSON",
-        value=st.session_state.token_response_raw,
-        height=180,
-        placeholder='{\n  "access_token": "eyJ...",\n  "token_type": "Bearer",\n  "expires_in": 3600,\n  "patient": "eABcDeFg...",\n  "scope": "patient/*.read openid fhirUser"\n}'
-    )
-    st.session_state.token_response_raw = token_resp
+    # ══════════════════════════════════════════════════════
+    # AUTOMATED TOKEN EXCHANGE WITH FULL LOGGING
+    # ══════════════════════════════════════════════════════
+    st.markdown("---")
+    st.markdown("### 🚀 Automated Token Exchange")
+    st.markdown("""
+    <div class='info-box'>
+    Click below to fire the token exchange <strong>directly from this app</strong>. 
+    Every detail of the request and response will be logged below for debugging.
+    </div>
+    """, unsafe_allow_html=True)
 
-    if token_resp.strip():
+    can_fire = token_ep and auth_code and jwt_val
+    if not can_fire:
+        missing = []
+        if not token_ep: missing.append("Token Endpoint")
+        if not auth_code: missing.append("Auth Code")
+        if not jwt_val: missing.append("JWT")
+        st.warning(f"⚠️ Missing: **{', '.join(missing)}** — fill these in above before firing.")
+
+    if st.button("🔥 Fire Token Exchange", type="primary", key="fire_token", disabled=not can_fire):
+        import requests as req_lib
+        import traceback
+
+        exchange_log = []
+        exchange_log.append(f"{'='*80}")
+        exchange_log.append(f"EPIC FHIR TOKEN EXCHANGE — FULL DEBUG LOG")
+        exchange_log.append(f"Timestamp: {datetime.now().isoformat()}")
+        exchange_log.append(f"Unix Time: {int(time.time())}")
+        exchange_log.append(f"{'='*80}")
+
+        # ── Request details ──────────────────────────────
+        request_body = {
+            "grant_type": "authorization_code",
+            "code": auth_code,
+            "redirect_uri": redirect_uri,
+            "client_assertion_type": "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+            "client_assertion": jwt_val,
+        }
+        request_headers = {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json",
+        }
+
+        exchange_log.append(f"\n{'─'*40}")
+        exchange_log.append(f"REQUEST")
+        exchange_log.append(f"{'─'*40}")
+        exchange_log.append(f"Method: POST")
+        exchange_log.append(f"URL:    {token_ep}")
+        exchange_log.append(f"\nHeaders:")
+        for k, v in request_headers.items():
+            exchange_log.append(f"  {k}: {v}")
+        exchange_log.append(f"\nBody Parameters:")
+        for k, v in request_body.items():
+            if k == "client_assertion":
+                exchange_log.append(f"  {k}: {v[:80]}...({len(v)} chars)")
+            elif k == "code":
+                exchange_log.append(f"  {k}: {v}")
+            else:
+                exchange_log.append(f"  {k}: {v}")
+
+        # ── JWT decode for inspection ────────────────────
+        exchange_log.append(f"\n{'─'*40}")
+        exchange_log.append(f"JWT INSPECTION")
+        exchange_log.append(f"{'─'*40}")
         try:
-            resp = json.loads(token_resp)
-
-            # ── Error handling ───────────────────────────────────
-            if "error" in resp:
-                error_code = resp.get("error", "")
-                error_desc = resp.get("error_description", "No description provided")
-
-                if error_code == "invalid_grant":
-                    st.error(f"❌ **invalid_grant** — {error_desc}")
-
-                    st.markdown("""
-                    <div class='warn-box'>
-                    <strong>🔍 Diagnosing <code>invalid_grant</code></strong><br><br>
-                    This error means Epic rejected the authorization code or the token request parameters. 
-                    Work through this checklist <strong>top to bottom</strong> — the most common cause is #1.
-                    </div>
-                    """, unsafe_allow_html=True)
-
-                    st.markdown("---")
-                    st.markdown("#### 🔎 Diagnostic Checklist")
-
-                    # Cause 1: Expired auth code
-                    st.markdown("""
-                    **① Auth code expired (⏱ MOST COMMON)**
-                    
-                    The auth code from Step 3 expires in **~5 minutes**. If you spent time 
-                    generating the JWT in Step 4, the code is likely dead by now.
-                    
-                    **Fix:** Go back to Step 2, paste the authorize URL in your browser again, 
-                    log into MyChart, grab a **fresh code**, then **immediately** do the token exchange 
-                    (have Postman pre-loaded and the JWT already generated).
-                    """)
-
-                    # Cause 2: Code already used
-                    st.markdown("""
-                    **② Auth code already used**
-                    
-                    Each auth code is **one-time use only**. If you already tried a token exchange 
-                    with this code (even if it failed for another reason), the code is burned.
-                    
-                    **Fix:** Get a fresh code from Step 3.
-                    """)
-
-                    # Cause 3: redirect_uri mismatch
-                    st.markdown("""
-                    **③ redirect_uri mismatch**
-                    
-                    The `redirect_uri` in the token request must **exactly match** what was used 
-                    in the authorize URL — same scheme, host, path, no trailing slash difference.
-                    """)
-                    col_a, col_b = st.columns(2)
-                    with col_a:
-                        st.markdown(f"**Authorize URL used:**")
-                        st.code(st.session_state.redirect_uri, language="text")
-                    with col_b:
-                        st.markdown(f"**Token request using:**")
-                        st.code(redirect_uri, language="text")
-                    if st.session_state.redirect_uri.rstrip("/") != redirect_uri.rstrip("/"):
-                        st.error("⚠️ **MISMATCH DETECTED** — these don't match!")
-                    else:
-                        st.success("✅ redirect_uri matches")
-
-                    # Cause 4: JWT timing issues
-                    st.markdown("""
-                    **④ JWT timing issues (`iat`, `nbf`, `exp`)**
-                    
-                    Epic is strict about timestamps:
-                    - `iat` and `nbf` must **NOT** be in the future
-                    - `exp` must be in the future but **≤ 5 min** after `iat`
-                    - Server clock skew can cause issues
-                    """)
-                    if st.session_state.jwt_generated:
-                        try:
-                            parts = st.session_state.jwt_generated.split(".")
-                            padded = parts[1] + "=" * (4 - len(parts[1]) % 4)
-                            payload_data = json.loads(base64.urlsafe_b64decode(padded))
-                            jwt_iat = payload_data.get("iat", 0)
-                            jwt_exp = payload_data.get("exp", 0)
-                            jwt_nbf = payload_data.get("nbf", 0)
-                            now_check = int(time.time())
-
-                            c1, c2, c3, c4 = st.columns(4)
-                            with c1:
-                                st.metric("Current Time", now_check)
-                            with c2:
-                                age = now_check - jwt_iat
-                                st.metric("JWT iat", jwt_iat, delta=f"{age}s ago", delta_color="inverse")
-                            with c3:
-                                remaining = jwt_exp - now_check
-                                st.metric("JWT exp", jwt_exp, delta=f"{remaining}s left", delta_color="normal")
-                            with c4:
-                                st.metric("JWT nbf", jwt_nbf)
-
-                            issues = []
-                            if jwt_iat > now_check:
-                                issues.append("❌ `iat` is in the FUTURE")
-                            if jwt_nbf > now_check:
-                                issues.append("❌ `nbf` is in the FUTURE")
-                            if jwt_exp <= now_check:
-                                issues.append("❌ `exp` is in the PAST — JWT has expired!")
-                            if jwt_exp - jwt_iat > 300:
-                                issues.append("⚠️ `exp` is more than 5 min after `iat`")
-
-                            if issues:
-                                for issue in issues:
-                                    st.warning(issue)
-                                st.markdown("**Fix:** Go to Step 4, click **Sign JWT** again to generate a fresh one with current timestamps.")
-                            else:
-                                st.success("✅ JWT timestamps look valid")
-                        except Exception:
-                            st.warning("Could not decode JWT to check timestamps")
-
-                    # Cause 5: aud mismatch
-                    st.markdown("""
-                    **⑤ `aud` in JWT doesn't match token endpoint**
-                    
-                    The `aud` claim in your JWT must be the **exact** token endpoint URL.
-                    """)
-                    if st.session_state.jwt_generated:
-                        try:
-                            parts = st.session_state.jwt_generated.split(".")
-                            padded = parts[1] + "=" * (4 - len(parts[1]) % 4)
-                            payload_data = json.loads(base64.urlsafe_b64decode(padded))
-                            jwt_aud = payload_data.get("aud", "")
-                            col_a, col_b = st.columns(2)
-                            with col_a:
-                                st.code(f"JWT aud: {jwt_aud}", language="text")
-                            with col_b:
-                                st.code(f"Token EP: {token_ep}", language="text")
-                            if jwt_aud == token_ep:
-                                st.success("✅ `aud` matches token endpoint")
-                            else:
-                                st.error("⚠️ **MISMATCH** — `aud` doesn't match the token endpoint!")
-                        except Exception:
-                            pass
-
-                    # Cause 6: JTI reuse
-                    st.markdown("""
-                    **⑥ `jti` reused**
-                    
-                    Epic requires a **unique** `jti` for every token request. If you're reusing 
-                    the same JWT from a previous attempt, the `jti` is already burned.
-                    
-                    **Fix:** Go to Step 4, click **Sign JWT** again (it auto-generates a new UUID).
-                    """)
-
-                    # Cause 7: Key mismatch
-                    st.markdown("""
-                    **⑦ Private key doesn't match JWKS public key**
-                    
-                    The key you signed with must correspond to a public key at your registered 
-                    JWKS URL. Also verify the `kid` in the JWT header matches a key in the JWKS.
-                    """)
-                    st.code(f"JWKS URL: {st.session_state.jwks_url}\nJWT kid:  {st.session_state.kid or '(not set)'}", language="text")
-
-                    # Quick retry workflow
-                    st.markdown("---")
-                    st.markdown("#### 🚀 Quick Retry Workflow")
-                    st.markdown("""
-                    Since the most common cause is an expired/reused auth code + stale JWT:
-                    
-                    1. **Step 4:** Click **Sign JWT** to get a fresh JWT with new timestamps + jti
-                    2. **Step 2:** Paste the authorize URL in your browser again
-                    3. **Step 3:** Log into MyChart, grab the new code **fast**
-                    4. **Step 5:** Immediately paste the new code + fresh JWT into Postman and fire
-                    
-                    💡 **Pro tip:** Have Postman already set up with everything except `code` 
-                    and `client_assertion`. Generate the JWT first, paste it into Postman, 
-                    THEN go get the auth code, paste it, and hit Send within seconds.
-                    """)
-
-                    col_back, col_retry = st.columns(2)
-                    with col_back:
-                        if st.button("← Go to Step 4 (Re-sign JWT)", key="retry_jwt"):
-                            st.session_state.current_step = 4
-                            st.rerun()
-                    with col_retry:
-                        if st.button("← Go to Step 2 (Get fresh code)", type="primary", key="retry_code"):
-                            st.session_state.auth_code = ""
-                            st.session_state.token_response_raw = ""
-                            st.session_state.current_step = 2
-                            st.rerun()
-
+            jwt_parts = jwt_val.split(".")
+            exchange_log.append(f"JWT Parts: {len(jwt_parts)}")
+            # Header
+            hdr_padded = jwt_parts[0] + "=" * (4 - len(jwt_parts[0]) % 4)
+            jwt_hdr = json.loads(base64.urlsafe_b64decode(hdr_padded))
+            exchange_log.append(f"\nJWT Header:")
+            for k, v in jwt_hdr.items():
+                exchange_log.append(f"  {k}: {v}")
+            # Payload
+            pay_padded = jwt_parts[1] + "=" * (4 - len(jwt_parts[1]) % 4)
+            jwt_pay = json.loads(base64.urlsafe_b64decode(pay_padded))
+            exchange_log.append(f"\nJWT Payload:")
+            now_ts = int(time.time())
+            for k, v in jwt_pay.items():
+                if k in ("iat", "nbf", "exp"):
+                    age = now_ts - v if k != "exp" else v - now_ts
+                    label = "ago" if k != "exp" else "remaining"
+                    exchange_log.append(f"  {k}: {v}  ({age}s {label})")
+                elif k == "extensions":
+                    exchange_log.append(f"  {k}: {json.dumps(v)[:100]}...")
                 else:
-                    # Other OAuth errors
-                    st.error(f"❌ **{error_code}** — {error_desc}")
-                    if error_code == "invalid_client":
-                        st.markdown("""
-                        **`invalid_client`** means Epic doesn't recognize your client credentials. Check:
-                        - `client_id` matches what's registered with Epic
-                        - JWT signature verifies against a key in your JWKS
-                        - Your JWKS URL is reachable from Epic's servers
-                        - If you recently uploaded a new key, wait **60 minutes** for sync
-                        """)
-                    elif error_code == "invalid_request":
-                        st.markdown("""
-                        **`invalid_request`** means a required parameter is missing or malformed. Check:
-                        - All required fields are present in the POST body
-                        - `client_assertion_type` is exactly `urn:ietf:params:oauth:client-assertion-type:jwt-bearer`
-                        - Body is `x-www-form-urlencoded` (not JSON)
-                        """)
+                    exchange_log.append(f"  {k}: {v}")
+            exchange_log.append(f"\n  Current time: {now_ts}")
 
-            # ── Success handling ─────────────────────────────────
-            elif "access_token" in resp:
-                st.session_state.access_token = resp.get("access_token", "")
-                st.session_state.patient_id = resp.get("patient", "")
-                st.success("✅ Token exchange successful!")
+            # Timing checks
+            if jwt_pay.get("exp", 0) <= now_ts:
+                exchange_log.append(f"  ⚠️  JWT IS EXPIRED! exp={jwt_pay.get('exp')} < now={now_ts}")
+            if jwt_pay.get("iat", 0) > now_ts:
+                exchange_log.append(f"  ⚠️  iat IS IN THE FUTURE!")
+            if jwt_pay.get("aud") != token_ep:
+                exchange_log.append(f"  ⚠️  aud MISMATCH! JWT aud={jwt_pay.get('aud')} vs token_ep={token_ep}")
+        except Exception as e:
+            exchange_log.append(f"  Could not decode JWT: {e}")
+
+        # ── Validate redirect_uri match ──────────────────
+        exchange_log.append(f"\n{'─'*40}")
+        exchange_log.append(f"VALIDATION CHECKS")
+        exchange_log.append(f"{'─'*40}")
+        exchange_log.append(f"redirect_uri in request: {redirect_uri}")
+        exchange_log.append(f"redirect_uri in session: {st.session_state.redirect_uri}")
+        if redirect_uri != st.session_state.redirect_uri:
+            exchange_log.append(f"  ⚠️  REDIRECT URI MISMATCH!")
+        else:
+            exchange_log.append(f"  ✅ redirect_uri matches")
+        exchange_log.append(f"client_id (from JWT sub): {jwt_pay.get('sub', 'N/A') if 'jwt_pay' in dir() else 'N/A'}")
+        exchange_log.append(f"kid (from JWT header): {jwt_hdr.get('kid', 'N/A') if 'jwt_hdr' in dir() else 'N/A'}")
+        exchange_log.append(f"jku (from JWT header): {jwt_hdr.get('jku', 'N/A') if 'jwt_hdr' in dir() else 'N/A'}")
+
+        # ── FIRE THE REQUEST ─────────────────────────────
+        exchange_log.append(f"\n{'─'*40}")
+        exchange_log.append(f"SENDING REQUEST...")
+        exchange_log.append(f"{'─'*40}")
+
+        try:
+            resp_obj = req_lib.post(
+                token_ep,
+                data=request_body,
+                headers=request_headers,
+                timeout=30,
+            )
+
+            exchange_log.append(f"\n{'─'*40}")
+            exchange_log.append(f"RESPONSE")
+            exchange_log.append(f"{'─'*40}")
+            exchange_log.append(f"Status Code: {resp_obj.status_code}")
+            exchange_log.append(f"Reason:      {resp_obj.reason}")
+            exchange_log.append(f"Elapsed:     {resp_obj.elapsed.total_seconds():.3f}s")
+            exchange_log.append(f"\nResponse Headers:")
+            for k, v in resp_obj.headers.items():
+                exchange_log.append(f"  {k}: {v}")
+            exchange_log.append(f"\nResponse Body (raw):")
+            exchange_log.append(resp_obj.text)
+
+            # Parse response
+            try:
+                resp_json = resp_obj.json()
+                exchange_log.append(f"\nResponse Body (parsed JSON):")
+                exchange_log.append(json.dumps(resp_json, indent=2))
+            except Exception:
+                resp_json = None
+                exchange_log.append(f"\n  Could not parse response as JSON")
+
+            # ── Display results ──────────────────────────
+            full_log = "\n".join(exchange_log)
+
+            if resp_obj.status_code == 200 and resp_json and "access_token" in resp_json:
+                st.success(f"✅ Token exchange successful! (HTTP {resp_obj.status_code}, {resp_obj.elapsed.total_seconds():.1f}s)")
+                st.session_state.access_token = resp_json.get("access_token", "")
+                st.session_state.patient_id = resp_json.get("patient", "")
+                st.session_state.token_response_raw = json.dumps(resp_json, indent=2)
 
                 c1, c2, c3 = st.columns(3)
                 with c1:
-                    st.metric("Token Type", resp.get("token_type", "—"))
+                    st.metric("Token Type", resp_json.get("token_type", "—"))
                 with c2:
-                    exp = resp.get("expires_in", "—")
+                    exp = resp_json.get("expires_in", "—")
                     st.metric("Expires In", f"{exp}s" if exp != "—" else "—")
                 with c3:
                     pid = st.session_state.patient_id
                     st.metric("Patient ID", (pid[:20] + "...") if len(pid) > 20 else pid or "—")
 
-                if st.session_state.access_token:
-                    with st.expander("🔑 Access Token"):
-                        st.code(st.session_state.access_token, language="text")
+                with st.expander("🔑 Access Token"):
+                    st.code(st.session_state.access_token, language="text")
+                with st.expander("📋 Full Response"):
+                    st.json(resp_json)
 
-                # Show all fields
+            else:
+                # ERROR RESPONSE
+                error_code = resp_json.get("error", f"HTTP {resp_obj.status_code}") if resp_json else f"HTTP {resp_obj.status_code}"
+                error_desc = resp_json.get("error_description", resp_obj.text[:200]) if resp_json else resp_obj.text[:200]
+
+                st.error(f"❌ **{error_code}** — {error_desc}")
+
+                # ── Error-specific diagnostics ───────────
+                if error_code == "unauthorized_client":
+                    st.markdown("""
+                    <div class='warn-box'>
+                    <strong>🔍 Diagnosing <code>unauthorized_client</code></strong><br><br>
+                    Epic does not recognize or authorize your client for this request. 
+                    This is <strong>NOT</strong> a JWT signature issue — it's an app registration / configuration issue.
+                    </div>
+                    """, unsafe_allow_html=True)
+                    st.markdown("""
+                    **① App registration deleted or expired after sandbox reset**
+                    
+                    Epic sandbox resets every Monday. Your app may have been wiped. 
+                    Check [fhir.epic.com/Developer/Apps](https://fhir.epic.com/Developer/Apps) and confirm 
+                    client ID `{cid}` still exists.
+                    
+                    **② Client ID mismatch**
+                    
+                    The `sub` and `iss` claims in your JWT must exactly match your registered client ID.
+                    
+                    **③ Grant type not authorized**
+                    
+                    Your app must be registered for `authorization_code` grant type (Confidential App).
+                    If it's registered as a Backend-only app, it won't support auth code flow.
+                    
+                    **④ JWKS URL unreachable from Epic**
+                    
+                    Epic must be able to fetch your JWKS at the registered URL. If it returns 
+                    a 404/500 or is behind a VPN, Epic can't verify your JWT → unauthorized_client.
+                    
+                    **⑤ Scopes not approved**
+                    
+                    If you're requesting scopes that weren't approved during app registration, 
+                    Epic may reject the entire request.
+                    
+                    **⑥ Redirect URI not registered**
+                    
+                    The redirect URI must be registered with the app. A mismatch can cause 
+                    unauthorized_client instead of the more specific invalid_redirect error.
+                    """.format(cid=st.session_state.client_id))
+
+                    # Show diagnostics
+                    st.markdown("#### 📊 Your Configuration")
+                    diag_data = {
+                        "Client ID (session)": st.session_state.client_id,
+                        "JWT sub claim": jwt_pay.get("sub", "N/A") if "jwt_pay" in dir() else "N/A",
+                        "JWT iss claim": jwt_pay.get("iss", "N/A") if "jwt_pay" in dir() else "N/A",
+                        "JWT aud claim": jwt_pay.get("aud", "N/A") if "jwt_pay" in dir() else "N/A",
+                        "Token Endpoint": token_ep,
+                        "JWKS URL (jku)": jwt_hdr.get("jku", "N/A") if "jwt_hdr" in dir() else "N/A",
+                        "kid": jwt_hdr.get("kid", "N/A") if "jwt_hdr" in dir() else "N/A",
+                        "Redirect URI": redirect_uri,
+                        "Scopes requested": st.session_state.get("scopes", "N/A"),
+                    }
+                    for label, val in diag_data.items():
+                        st.code(f"{label}: {val}", language="text")
+
+                elif error_code == "invalid_client":
+                    st.markdown("""
+                    <div class='warn-box'>
+                    <strong>🔍 Diagnosing <code>invalid_client</code></strong><br><br>
+                    Epic could not verify your client assertion JWT. This is a <strong>signature/key</strong> issue.
+                    </div>
+                    """, unsafe_allow_html=True)
+                    st.markdown("""
+                    **① JWKS key missing `alg` field** (P0 BLOCKER)
+                    
+                    Your key `{kid}` must have `"alg": "RS256"` in the JWKS JSON. 
+                    Without it, Epic can't determine which algorithm to verify with.
+                    
+                    **② kid mismatch — JWT kid doesn't match any key in JWKS**
+                    
+                    The `kid` in your JWT header must exactly match a `kid` in your JWKS.
+                    
+                    **③ Private key doesn't match the public key in JWKS**
+                    
+                    You may have signed with a different key pair than what's published.
+                    
+                    **④ JWKS URL returns error or wrong content**
+                    
+                    Epic fetches your JWKS URL to get the public key. If it returns HTML, 
+                    a 404, or is rate-limited, verification fails silently.
+                    
+                    **⑤ Epic JWKS cache is stale**
+                    
+                    After updating your JWKS, wait up to 60 minutes for Epic to re-fetch.
+                    """.format(kid=st.session_state.kid))
+
+                elif error_code == "invalid_grant":
+                    st.markdown("""
+                    <div class='warn-box'>
+                    <strong>🔍 Diagnosing <code>invalid_grant</code></strong><br><br>
+                    The auth code is expired, already used, or there's a parameter mismatch.
+                    </div>
+                    """, unsafe_allow_html=True)
+                    st.markdown("""
+                    **Most common:** Auth code expired (5-min window) or was already used.
+                    
+                    **Fix:** Go back to Step 2, get a fresh auth code, and fire immediately.
+                    """)
+
+                elif error_code == "invalid_request":
+                    st.markdown("""
+                    **`invalid_request`** — a required parameter is missing or malformed. Check:
+                    - `client_assertion_type` is exactly `urn:ietf:params:oauth:client-assertion-type:jwt-bearer`
+                    - Body is `x-www-form-urlencoded` (not JSON)
+                    - All required fields present
+                    """)
+
+            # ── ALWAYS show full debug log ───────────────
+            with st.expander("📜 FULL DEBUG LOG (copy this for troubleshooting)", expanded=True if resp_obj.status_code != 200 else False):
+                st.code(full_log, language="text")
+
+            # ── Download log button ──────────────────────
+            st.download_button(
+                label="💾 Download Debug Log",
+                data=full_log,
+                file_name=f"epic_token_exchange_{int(time.time())}.log",
+                mime="text/plain",
+                key="dl_log"
+            )
+
+        except req_lib.exceptions.ConnectionError as e:
+            exchange_log.append(f"\n❌ CONNECTION ERROR: {e}")
+            exchange_log.append(f"\nThis usually means:")
+            exchange_log.append(f"  - Token endpoint URL is wrong")
+            exchange_log.append(f"  - Network/firewall is blocking the request")
+            exchange_log.append(f"  - Epic server is down")
+            full_log = "\n".join(exchange_log)
+            st.error(f"❌ Connection failed: {e}")
+            st.code(full_log, language="text")
+        except req_lib.exceptions.Timeout:
+            exchange_log.append(f"\n❌ TIMEOUT after 30s")
+            full_log = "\n".join(exchange_log)
+            st.error("❌ Request timed out after 30 seconds")
+            st.code(full_log, language="text")
+        except Exception as e:
+            exchange_log.append(f"\n❌ UNEXPECTED ERROR: {e}")
+            exchange_log.append(traceback.format_exc())
+            full_log = "\n".join(exchange_log)
+            st.error(f"❌ Unexpected error: {e}")
+            st.code(full_log, language="text")
+
+    # ══════════════════════════════════════════════════════
+    # MANUAL FALLBACK — paste from Postman
+    # ══════════════════════════════════════════════════════
+    with st.expander("📋 Manual: Paste Token Response from Postman"):
+        token_resp = st.text_area(
+            "Token Response JSON",
+            value=st.session_state.token_response_raw,
+            height=180,
+            placeholder='{\n  "access_token": "eyJ...",\n  "token_type": "Bearer",\n  "expires_in": 3600,\n  "patient": "eABcDeFg...",\n  "scope": "patient/*.read openid fhirUser"\n}',
+            key="manual_token_resp"
+        )
+        st.session_state.token_response_raw = token_resp
+
+    if token_resp.strip():
+        try:
+            resp = json.loads(token_resp)
+            if "access_token" in resp:
+                st.session_state.access_token = resp.get("access_token", "")
+                st.session_state.patient_id = resp.get("patient", "")
+                st.success("✅ Access token extracted from pasted response!")
                 with st.expander("📋 Full Response"):
                     st.json(resp)
+            elif "error" in resp:
+                st.error(f"❌ **{resp.get('error')}** — {resp.get('error_description', 'No description')}")
+                st.info("💡 Use the **Fire Token Exchange** button above for full diagnostics.")
             else:
-                st.warning("Response doesn't contain `access_token` or `error`. Raw response:")
+                st.warning("Response doesn't contain `access_token` or `error`.")
                 st.json(resp)
-
         except json.JSONDecodeError:
-            st.error("Invalid JSON — paste the complete response from Postman.")
+            st.error("Invalid JSON — paste the complete response.")
 
     st.markdown("---")
     c1, c2 = st.columns(2)
