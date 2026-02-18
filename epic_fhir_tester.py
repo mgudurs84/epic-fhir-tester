@@ -1410,56 +1410,348 @@ elif step == 6:
     st.markdown("## Step 6: Query FHIR Resources")
     st.markdown("""
     <div class='info-box'>
-    Use the <strong>access token</strong> as a Bearer token to query Camila's health records.
-    Run these in Postman with <code>Authorization: Bearer &lt;token&gt;</code>.
+    Use the <strong>access token</strong> to query Camila's health records.
+    Click <strong>🔥 Fire All Queries</strong> to run them directly from this app with full logging.
     </div>
     """, unsafe_allow_html=True)
 
     fhir_base = st.session_state.fhir_base_url.rstrip("/")
     patient_id = st.text_input("Patient ID (from token response)", st.session_state.patient_id)
-    access_token = st.text_input("Access Token", st.session_state.access_token[:40] + "..." if len(st.session_state.access_token) > 40 else st.session_state.access_token, disabled=True)
+    st.session_state.patient_id = patient_id
+    access_token_display = st.session_state.access_token[:40] + "..." if len(st.session_state.access_token) > 40 else st.session_state.access_token
+    st.text_input("Access Token", access_token_display, disabled=True)
+
+    if not st.session_state.access_token:
+        st.warning("⚠️ No access token — go back to Step 5 and complete the token exchange first.")
+    if not patient_id:
+        st.warning("⚠️ No Patient ID — this should have been returned in the token response.")
 
     resources = [
         ("Patient", f"Patient/{patient_id}", "Demographics, identifiers, addresses"),
-        ("DocumentReference", f"DocumentReference?patient={patient_id}", "Clinical documents (C-CDA, discharge summaries)"),
         ("Condition", f"Condition?patient={patient_id}", "Diagnoses and problems"),
         ("AllergyIntolerance", f"AllergyIntolerance?patient={patient_id}", "Allergies and adverse reactions"),
         ("MedicationRequest", f"MedicationRequest?patient={patient_id}", "Prescriptions and medication orders"),
         ("Immunization", f"Immunization?patient={patient_id}", "Vaccination records"),
-        ("Observation", f"Observation?patient={patient_id}&category=vital-signs", "Vital signs (BP, weight, etc.)"),
+        ("Observation (Vitals)", f"Observation?patient={patient_id}&category=vital-signs", "Vital signs (BP, weight, etc.)"),
         ("Observation (Labs)", f"Observation?patient={patient_id}&category=laboratory", "Lab results"),
+        ("DocumentReference", f"DocumentReference?patient={patient_id}", "Clinical documents (C-CDA, discharge summaries)"),
         ("Encounter", f"Encounter?patient={patient_id}", "Visits and encounters"),
         ("Procedure", f"Procedure?patient={patient_id}", "Surgical and clinical procedures"),
     ]
 
-    st.markdown("### Available FHIR Queries")
-    for name, path, desc in resources:
-        full_url = f"{fhir_base}/{path}"
-        with st.expander(f"📄 {name} — {desc}"):
-            st.markdown(f"<p class='code-label'>GET Request</p>", unsafe_allow_html=True)
-            st.code(f"GET {full_url}\nAuthorization: Bearer <access_token>\nAccept: application/fhir+json", language="http")
+    # ── Resource picker ──────────────────────────────────
+    st.markdown("### Select Resources to Query")
+    select_all = st.checkbox("Select All", value=True, key="select_all_res")
+    selected_resources = []
+    cols_per_row = 5
+    for row_start in range(0, len(resources), cols_per_row):
+        cols = st.columns(cols_per_row)
+        for i, col in enumerate(cols):
+            idx = row_start + i
+            if idx < len(resources):
+                name, path, desc = resources[idx]
+                with col:
+                    if st.checkbox(name.replace(" (Vitals)", "").replace(" (Labs)", " Labs"), value=select_all, key=f"sel_{name}"):
+                        selected_resources.append((name, path, desc))
 
-            curl = f"""curl -s "{full_url}" \\
-  -H "Authorization: Bearer {st.session_state.access_token[:30] + '...' if st.session_state.access_token else '<ACCESS_TOKEN>'}" \\
-  -H "Accept: application/fhir+json" | python3 -m json.tool"""
+    # ══════════════════════════════════════════════════════
+    # AUTOMATED FHIR QUERYING
+    # ══════════════════════════════════════════════════════
+    st.markdown("---")
+    can_query = st.session_state.access_token and patient_id and fhir_base and selected_resources
+    
+    if st.button("🔥 Fire All FHIR Queries", type="primary", key="fire_fhir", disabled=not can_query):
+        import requests as req_lib
+
+        query_log = []
+        query_log.append(f"{'='*80}")
+        query_log.append(f"EPIC FHIR RESOURCE QUERIES — FULL DEBUG LOG")
+        query_log.append(f"Timestamp: {datetime.now().isoformat()}")
+        query_log.append(f"FHIR Base: {fhir_base}")
+        query_log.append(f"Patient ID: {patient_id}")
+        query_log.append(f"Resources: {len(selected_resources)}")
+        query_log.append(f"{'='*80}")
+
+        headers = {
+            "Authorization": f"Bearer {st.session_state.access_token}",
+            "Accept": "application/fhir+json",
+        }
+
+        progress_bar = st.progress(0, text="Querying FHIR resources...")
+        results_container = st.container()
+        success_count = 0
+        error_count = 0
+        total_records = 0
+
+        for i, (name, path, desc) in enumerate(selected_resources):
+            full_url = f"{fhir_base}/{path}"
+            progress_bar.progress((i + 1) / len(selected_resources), text=f"Querying {name}...")
+
+            query_log.append(f"\n{'─'*60}")
+            query_log.append(f"RESOURCE: {name}")
+            query_log.append(f"{'─'*60}")
+            query_log.append(f"URL: GET {full_url}")
+            query_log.append(f"Headers:")
+            query_log.append(f"  Authorization: Bearer {st.session_state.access_token[:30]}...")
+            query_log.append(f"  Accept: application/fhir+json")
+
+            try:
+                resp = req_lib.get(full_url, headers=headers, timeout=30)
+
+                query_log.append(f"\nStatus: {resp.status_code} {resp.reason}")
+                query_log.append(f"Elapsed: {resp.elapsed.total_seconds():.3f}s")
+                query_log.append(f"Content-Type: {resp.headers.get('Content-Type', 'N/A')}")
+                query_log.append(f"Content-Length: {resp.headers.get('Content-Length', len(resp.text))}")
+
+                # Log key response headers
+                for hdr in ["X-Request-Id", "X-Correlation-Id", "WWW-Authenticate", "ETag"]:
+                    if hdr in resp.headers:
+                        query_log.append(f"{hdr}: {resp.headers[hdr]}")
+
+                if resp.status_code == 200:
+                    try:
+                        data = resp.json()
+                        rtype = data.get("resourceType", "Unknown")
+
+                        if rtype == "Bundle":
+                            entry_count = len(data.get("entry", []))
+                            total_field = data.get("total", entry_count)
+                            query_log.append(f"ResourceType: Bundle")
+                            query_log.append(f"Total: {total_field}")
+                            query_log.append(f"Entries in page: {entry_count}")
+
+                            st.session_state.fhir_results[name] = json.dumps(data, indent=2)
+                            total_records += total_field if isinstance(total_field, int) else entry_count
+
+                            with results_container:
+                                if entry_count > 0:
+                                    st.success(f"✅ **{name}** — {total_field} record(s) ({resp.elapsed.total_seconds():.1f}s)")
+                                    with st.expander(f"📄 {name} — {total_field} records", expanded=False):
+                                        # Summary table for key resources
+                                        if name == "Condition" and data.get("entry"):
+                                            conditions = []
+                                            for entry in data["entry"][:20]:
+                                                r = entry.get("resource", {})
+                                                code = r.get("code", {})
+                                                coding = code.get("coding", [{}])[0] if code.get("coding") else {}
+                                                conditions.append({
+                                                    "Condition": code.get("text", coding.get("display", "—")),
+                                                    "Code": coding.get("code", "—"),
+                                                    "System": coding.get("system", "—").split("/")[-1],
+                                                    "Status": r.get("clinicalStatus", {}).get("coding", [{}])[0].get("code", "—") if r.get("clinicalStatus") else "—",
+                                                    "Onset": str(r.get("onsetDateTime", r.get("onsetPeriod", {}).get("start", "—")))[:10],
+                                                })
+                                            st.dataframe(conditions, use_container_width=True)
+
+                                        elif name == "MedicationRequest" and data.get("entry"):
+                                            meds = []
+                                            for entry in data["entry"][:20]:
+                                                r = entry.get("resource", {})
+                                                med = r.get("medicationCodeableConcept", r.get("medicationReference", {}))
+                                                if isinstance(med, dict):
+                                                    med_name = med.get("text", med.get("display", "—"))
+                                                    coding = med.get("coding", [{}])[0] if med.get("coding") else {}
+                                                else:
+                                                    med_name = str(med)
+                                                    coding = {}
+                                                meds.append({
+                                                    "Medication": med_name,
+                                                    "Status": r.get("status", "—"),
+                                                    "Intent": r.get("intent", "—"),
+                                                    "Authored": str(r.get("authoredOn", "—"))[:10],
+                                                })
+                                            st.dataframe(meds, use_container_width=True)
+
+                                        elif name == "AllergyIntolerance" and data.get("entry"):
+                                            allergies = []
+                                            for entry in data["entry"][:20]:
+                                                r = entry.get("resource", {})
+                                                code = r.get("code", {})
+                                                coding = code.get("coding", [{}])[0] if code.get("coding") else {}
+                                                allergies.append({
+                                                    "Allergen": code.get("text", coding.get("display", "—")),
+                                                    "Type": r.get("type", "—"),
+                                                    "Category": ", ".join(r.get("category", ["—"])),
+                                                    "Criticality": r.get("criticality", "—"),
+                                                    "Status": r.get("clinicalStatus", {}).get("coding", [{}])[0].get("code", "—") if r.get("clinicalStatus") else "—",
+                                                })
+                                            st.dataframe(allergies, use_container_width=True)
+
+                                        elif name == "Immunization" and data.get("entry"):
+                                            immunizations = []
+                                            for entry in data["entry"][:20]:
+                                                r = entry.get("resource", {})
+                                                vaccine = r.get("vaccineCode", {})
+                                                coding = vaccine.get("coding", [{}])[0] if vaccine.get("coding") else {}
+                                                immunizations.append({
+                                                    "Vaccine": vaccine.get("text", coding.get("display", "—")),
+                                                    "Date": str(r.get("occurrenceDateTime", "—"))[:10],
+                                                    "Status": r.get("status", "—"),
+                                                })
+                                            st.dataframe(immunizations, use_container_width=True)
+
+                                        else:
+                                            # Generic: show first 5 entries as JSON
+                                            for j, entry in enumerate(data["entry"][:5]):
+                                                st.json(entry.get("resource", entry))
+                                            if entry_count > 5:
+                                                st.caption(f"... and {entry_count - 5} more entries")
+
+                                    success_count += 1
+                                else:
+                                    st.info(f"ℹ️ **{name}** — 0 records returned ({resp.elapsed.total_seconds():.1f}s)")
+                                    success_count += 1
+
+                        elif rtype == "Patient":
+                            query_log.append(f"ResourceType: Patient")
+                            query_log.append(f"Patient ID: {data.get('id', 'N/A')}")
+                            st.session_state.fhir_results[name] = json.dumps(data, indent=2)
+                            total_records += 1
+                            success_count += 1
+
+                            with results_container:
+                                st.success(f"✅ **{name}** — found ({resp.elapsed.total_seconds():.1f}s)")
+                                with st.expander(f"👤 {name} — Demographics", expanded=False):
+                                    p_name = data.get("name", [{}])[0]
+                                    given = " ".join(p_name.get("given", []))
+                                    family = p_name.get("family", "")
+                                    dob = data.get("birthDate", "—")
+                                    gender = data.get("gender", "—")
+                                    st.markdown(f"**Name:** {given} {family}")
+                                    st.markdown(f"**DOB:** {dob}  |  **Gender:** {gender}")
+                                    if data.get("address"):
+                                        addr = data["address"][0]
+                                        st.markdown(f"**Address:** {', '.join(addr.get('line', []))} {addr.get('city', '')}, {addr.get('state', '')} {addr.get('postalCode', '')}")
+                                    if data.get("telecom"):
+                                        for t in data["telecom"][:3]:
+                                            st.markdown(f"**{t.get('system', '')}:** {t.get('value', '')}")
+                                    st.json(data)
+
+                        elif rtype == "OperationOutcome":
+                            issues = data.get("issue", [])
+                            severity = issues[0].get("severity", "error") if issues else "error"
+                            diag = issues[0].get("diagnostics", "No details") if issues else "No details"
+                            query_log.append(f"ResourceType: OperationOutcome")
+                            query_log.append(f"Severity: {severity}")
+                            query_log.append(f"Diagnostics: {diag}")
+
+                            with results_container:
+                                if severity in ("error", "fatal"):
+                                    st.error(f"❌ **{name}** — OperationOutcome: {diag[:100]}")
+                                    error_count += 1
+                                else:
+                                    st.warning(f"⚠️ **{name}** — OperationOutcome ({severity}): {diag[:100]}")
+                                    success_count += 1
+                                with st.expander(f"OperationOutcome for {name}"):
+                                    st.json(data)
+                        else:
+                            st.session_state.fhir_results[name] = json.dumps(data, indent=2)
+                            success_count += 1
+                            with results_container:
+                                st.success(f"✅ **{name}** — {rtype} ({resp.elapsed.total_seconds():.1f}s)")
+                                with st.expander(f"View {name}"):
+                                    st.json(data)
+
+                    except json.JSONDecodeError:
+                        query_log.append(f"Response is NOT JSON:")
+                        query_log.append(resp.text[:500])
+                        with results_container:
+                            st.error(f"❌ **{name}** — Response is not JSON")
+                            with st.expander(f"Raw response for {name}"):
+                                st.code(resp.text[:1000], language="text")
+                        error_count += 1
+
+                elif resp.status_code == 401:
+                    query_log.append(f"⚠️ 401 UNAUTHORIZED")
+                    query_log.append(f"WWW-Authenticate: {resp.headers.get('WWW-Authenticate', 'N/A')}")
+                    query_log.append(f"Body: {resp.text[:500]}")
+                    with results_container:
+                        st.error(f"❌ **{name}** — 401 Unauthorized (token may be expired or invalid)")
+                        www_auth = resp.headers.get("WWW-Authenticate", "")
+                        if www_auth:
+                            st.code(f"WWW-Authenticate: {www_auth}", language="text")
+                    error_count += 1
+
+                elif resp.status_code == 403:
+                    query_log.append(f"⚠️ 403 FORBIDDEN — scope may not include this resource")
+                    query_log.append(f"Body: {resp.text[:500]}")
+                    with results_container:
+                        st.warning(f"⚠️ **{name}** — 403 Forbidden (scope may not cover this resource)")
+                    error_count += 1
+
+                elif resp.status_code == 404:
+                    query_log.append(f"ℹ️ 404 NOT FOUND — resource or patient not found")
+                    with results_container:
+                        st.info(f"ℹ️ **{name}** — 404 Not Found")
+                    success_count += 1
+
+                else:
+                    query_log.append(f"⚠️ HTTP {resp.status_code}")
+                    query_log.append(f"Body: {resp.text[:500]}")
+                    with results_container:
+                        st.error(f"❌ **{name}** — HTTP {resp.status_code}: {resp.text[:200]}")
+                    error_count += 1
+
+            except Exception as e:
+                query_log.append(f"❌ EXCEPTION: {e}")
+                with results_container:
+                    st.error(f"❌ **{name}** — {e}")
+                error_count += 1
+
+        # ── Summary ──────────────────────────────────────
+        progress_bar.progress(1.0, text="Done!")
+
+        query_log.append(f"\n{'='*60}")
+        query_log.append(f"SUMMARY")
+        query_log.append(f"{'='*60}")
+        query_log.append(f"Successful: {success_count}")
+        query_log.append(f"Errors: {error_count}")
+        query_log.append(f"Total Records: {total_records}")
+
+        st.markdown("---")
+        st.markdown("### 📊 Query Summary")
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.metric("Successful", success_count, delta_color="normal")
+        with c2:
+            st.metric("Errors", error_count, delta_color="inverse")
+        with c3:
+            st.metric("Total Records", total_records)
+
+        if error_count > 0 and success_count == 0:
+            st.error("❌ All queries failed. Check if the access token is still valid (tokens expire in ~60 min).")
+            st.markdown("**Common causes:**")
+            st.markdown("- Access token expired → go back to Step 5 and get a new one")
+            st.markdown("- Patient ID is wrong → check the token response from Step 5")
+            st.markdown("- FHIR Base URL is wrong → verify from SMART discovery in Step 1")
+
+        full_log = "\n".join(query_log)
+        with st.expander("📜 FULL FHIR QUERY LOG", expanded=error_count > 0):
+            st.code(full_log, language="text")
+
+        st.download_button(
+            label="💾 Download FHIR Query Log",
+            data=full_log,
+            file_name=f"epic_fhir_queries_{int(time.time())}.log",
+            mime="text/plain",
+            key="dl_fhir_log"
+        )
+
+    # ── Manual fallback ──────────────────────────────────
+    with st.expander("📋 Manual: cURL commands + paste responses"):
+        for name, path, desc in resources:
+            full_url = f"{fhir_base}/{path}"
+            st.markdown(f"**{name}** — {desc}")
+            curl = f'curl -s "{full_url}" -H "Authorization: Bearer {st.session_state.access_token[:30]}..." -H "Accept: application/fhir+json"'
             st.code(curl, language="bash")
-
-            # Paste results
             res_json = st.text_area(
                 f"Paste {name} response:",
                 value=st.session_state.fhir_results.get(name, ""),
-                height=150,
-                key=f"res_{name}"
+                height=100,
+                key=f"manual_res_{name}"
             )
             if res_json.strip():
                 st.session_state.fhir_results[name] = res_json
-                try:
-                    parsed = json.loads(res_json)
-                    total = parsed.get("total", parsed.get("id", "—"))
-                    rtype = parsed.get("resourceType", "—")
-                    st.success(f"✅ {rtype} — {f'Total: {total}' if isinstance(total, int) else f'ID: {total}'}")
-                except json.JSONDecodeError:
-                    st.error("Invalid JSON")
 
     st.markdown("---")
     c1, c2 = st.columns(2)
